@@ -141,6 +141,7 @@ def _make_afc():
     obj.spoolman = None
     obj._td1_present = False
     obj._last_td1_query = 0.0
+    obj._td1_query_completion = None
     obj.lane_data_enabled = False
     obj.units = {}
     obj.lanes = {}
@@ -1999,165 +2000,186 @@ class TestToolLoad_DestExtruderAlreadyLoaded:
 
 # ── td1_present property ─────────────────────────────────────────────────────
 
-def _make_afc_for_td1(*, td1_present=False, last_td1_query=0.0,
-                       current_time=100.0, printer_ready=True,
-                       moonraker=True, is_printing=False,
-                       moonraker_td1_result=True):
-    """
-    Build an afc instance pre-configured for td1_present property tests.
-
-    Parameters
-    ----------
-    td1_present        : initial value of _td1_present
-    last_td1_query     : initial value of _last_td1_query (seconds, monotonic)
-    current_time       : value reactor.monotonic() will return
-    printer_ready      : if True, printer.state_message == 'Printer is ready'
-    moonraker          : if True, attach a MagicMock moonraker; if False leave None
-    is_printing        : return value of function.is_printing(check_movement=True)
-    moonraker_td1_result : value moonraker.check_for_td1() returns as [1] index
-    """
-    obj = _make_afc()
-    obj._td1_present = td1_present
-    obj._last_td1_query = last_td1_query
-    obj.reactor.monotonic = MagicMock(return_value=current_time)
-    obj.printer.state_message = 'Printer is ready' if printer_ready else 'Startup'
-    obj.function.is_printing = MagicMock(return_value=is_printing)
-
-    if moonraker:
-        obj.moonraker = MagicMock()
-        obj.moonraker.check_for_td1.return_value = (None, moonraker_td1_result)
-    else:
-        obj.moonraker = None
-
-    return obj
 
 
 class TestTd1Present:
-    """Tests for the afc.td1_present property."""
+    @pytest.mark.parametrize("cached", [False, True])
+    @pytest.mark.parametrize("guard", [
+        "not-ready", "no-client", "closed-client", "short-interval",
+        "exact-interval", "printing",
+    ])
+    def test_ineligible_status_keeps_cache_without_refresh(self, td1_owner, cached, guard):
+        obj = td1_owner
+        obj._td1_present = cached
+        client = obj.moonraker
+        if guard == "not-ready":
+            obj.printer.state_message = "Startup"
+        elif guard == "no-client":
+            obj.moonraker = None
+        elif guard == "closed-client":
+            client._closing = True
+        elif guard == "short-interval":
+            obj._last_td1_query = 90.0
+        elif guard == "exact-interval":
+            obj._last_td1_query = 70.0
+        else:
+            obj.function.is_printing.return_value = True
+        last_query = obj._last_td1_query
+        assert obj.td1_present is cached
+        assert obj._td1_query_completion is None
+        assert obj._last_td1_query == last_query
+        obj.reactor.run_callbacks()
+        client.check_for_td1.assert_not_called()
 
-    # ── cached-value paths (no moonraker call) ────────────────────────────────
-
-    def test_returns_cached_when_printer_not_ready(self):
-        """Returns _td1_present without querying moonraker when printer is not ready."""
-        obj = _make_afc_for_td1(td1_present=True, printer_ready=False)
-        assert obj.td1_present is True
-
-    def test_returns_cached_when_moonraker_is_none(self):
-        """Returns _td1_present without error when moonraker is None."""
-        obj = _make_afc_for_td1(td1_present=False, moonraker=False)
-        assert obj.td1_present is False
-
-    def test_returns_cached_when_query_interval_too_short(self):
-        """Returns _td1_present when less than 30 s have elapsed since last query."""
-        # current_time - last_td1_query == 10 s (< 30 s threshold)
-        obj = _make_afc_for_td1(td1_present=True, current_time=100.0, last_td1_query=90.0)
-        assert obj.td1_present is True
-    
-    def test_returns_cached_when_query_interval_too_short_td1_false(self):
-        """Does not refresh when printer is ready and interval has not passed."""
-        obj = _make_afc_for_td1(
-            td1_present=False,
-            current_time=100.0,
-            last_td1_query=90.0,
-            is_printing=False,
-            moonraker_td1_result=True,
-        )
-        assert obj.td1_present is False
-
-    def test_returns_cached_when_exactly_30s_elapsed(self):
-        """Interval must be *greater than* 30 s; exactly 30 s still returns cached value."""
-        obj = _make_afc_for_td1(td1_present=True, current_time=100.0, last_td1_query=70.0)
-        assert obj.td1_present is True
-
-    def test_returns_cached_when_is_printing(self):
-        """Does not refresh when printer is ready and interval has passed but a print is active."""
-        obj = _make_afc_for_td1(
-            td1_present=False,
-            current_time=100.0,
-            last_td1_query=0.0,
-            is_printing=True,
-            moonraker_td1_result=True,
-        )
-        assert obj.td1_present is False
-
-    # ── moonraker not called paths ────────────────────────────────────────────
-
-    def test_moonraker_not_called_when_printer_not_ready(self):
-        """moonraker.check_for_td1 is never invoked when the printer is not ready."""
-        obj = _make_afc_for_td1(printer_ready=False)
-        _ = obj.td1_present
-        obj.moonraker.check_for_td1.assert_not_called()
-
-    def test_moonraker_not_called_when_interval_too_short(self):
-        """moonraker.check_for_td1 is never invoked when the cooldown has not expired."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=90.0)
-        _ = obj.td1_present
-        obj.moonraker.check_for_td1.assert_not_called()
-
-    def test_moonraker_not_called_when_is_printing(self):
-        """moonraker.check_for_td1 is never invoked during an active print."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=0.0, is_printing=True)
-        _ = obj.td1_present
-        obj.moonraker.check_for_td1.assert_not_called()
-
-    # ── refresh paths ─────────────────────────────────────────────────────────
-
-    def test_returns_moonraker_value_when_all_conditions_met(self):
-        """Returns the fresh value from moonraker when printer is ready, interval > 30 s, not printing."""
-        obj = _make_afc_for_td1(
-            td1_present=False,
-            current_time=100.0,
-            last_td1_query=0.0,
-            is_printing=False,
-            moonraker_td1_result=True,
-        )
-        assert obj.td1_present is True
-
-    def test_updates_internal_td1_present_after_refresh(self):
-        """_td1_present is updated to the moonraker result after a successful refresh."""
-        obj = _make_afc_for_td1(
-            td1_present=False,
-            current_time=100.0,
-            last_td1_query=0.0,
-            moonraker_td1_result=True,
-        )
-        _ = obj.td1_present
-        assert obj._td1_present is True
-
-    def test_updates_last_query_time_after_refresh(self):
-        """_last_td1_query is updated to current_time after a successful refresh."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=0.0)
-        _ = obj.td1_present
+    @pytest.mark.parametrize("cached, fetched", [
+        (False, False), (False, True), (True, False), (True, True),
+    ])
+    def test_status_is_cached_until_refresh_callback(self, td1_owner, cached, fetched):
+        obj = td1_owner
+        obj._td1_present = cached
+        obj.moonraker.check_for_td1.return_value = (True, fetched, False)
+        assert obj.td1_present is cached
         assert obj._last_td1_query == 100.0
+        obj.moonraker.check_for_td1.assert_not_called()
+        obj.reactor.run_callbacks()
+        assert obj._td1_present is fetched
+        assert obj._td1_query_completion is None
+        obj.moonraker.check_for_td1.assert_called_once_with()
+        assert obj.function.is_printing.call_args_list == [
+            call(check_movement=True), call(check_movement=True)]
 
-    def test_last_query_time_unchanged_when_not_refreshed(self):
-        """_last_td1_query is not modified when the refresh is skipped (interval too short)."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=90.0)
-        _ = obj.td1_present
-        assert obj._last_td1_query == 90.0
 
-    def test_moonraker_called_once_per_refresh(self):
-        """moonraker.check_for_td1 is called exactly once when a refresh is due."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=0.0)
-        _ = obj.td1_present
-        obj.moonraker.check_for_td1.assert_called_once()
+@pytest.fixture
+def td1_owner(afc_connection):
+    from tests.test_AFC_moonraker_io import DeferredReactor
+    obj, io = afc_connection
+    obj.reactor = DeferredReactor()
+    obj.reactor.monotonic = lambda: 100.0
+    obj.printer.state_message = "Printer is ready"
+    obj.function = MagicMock()
+    obj.function.is_printing.return_value = False
+    obj.moonraker = MagicMock()
+    obj.moonraker._closing = False
+    obj.moonraker.check_for_td1.return_value = (True, True, False)
+    io.logger.messages.clear()
+    yield obj
 
-    def test_is_printing_called_with_check_movement(self):
-        """is_printing is invoked with check_movement=True when the refresh gate is reached."""
-        obj = _make_afc_for_td1(current_time=100.0, last_td1_query=0.0)
-        _ = obj.td1_present
-        obj.function.is_printing.assert_called_once_with(check_movement=True)
 
-    def test_refresh_stores_false_from_moonraker(self):
-        """A False result from moonraker is correctly stored and returned."""
-        obj = _make_afc_for_td1(
-            td1_present=True,
-            current_time=100.0,
-            last_td1_query=0.0,
-            moonraker_td1_result=False,
-        )
+class TestScheduleTd1Refresh:
+    def test_status_returns_cache_and_shares_one_pending_refresh(self, td1_owner):
+        obj = td1_owner
         assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        assert pending is not None
+        assert obj.td1_present is False
+        assert obj._td1_query_completion is pending
+        obj.moonraker.check_for_td1.assert_not_called()
+        obj.reactor.run_callbacks()
+        assert obj._td1_present is True
+        assert pending.wait() is True
+        assert obj._td1_query_completion is None
+        obj.moonraker.check_for_td1.assert_called_once_with()
+
+    def test_replaced_client_cannot_apply_queued_refresh(self, td1_owner):
+        obj = td1_owner
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        old = obj.moonraker
+        obj.moonraker = MagicMock()
+        obj.moonraker._closing = False
+        obj.reactor.run_callbacks()
         assert obj._td1_present is False
+        assert pending.wait() is False
+        assert obj._td1_query_completion is None
+        old.check_for_td1.assert_not_called()
+
+
+class TestRefreshTd1Present:
+    @pytest.mark.parametrize("guard", ["ready", "moving", "closed"])
+    def test_guard_rechecked_before_pending_refresh_runs(self, td1_owner, guard):
+        obj = td1_owner
+        obj._td1_present = True
+        assert obj.td1_present is True
+        pending = obj._td1_query_completion
+        if guard == "ready":
+            obj.printer.state_message = "Shutdown"
+        elif guard == "moving":
+            obj.function.is_printing.return_value = True
+        else:
+            obj.moonraker._closing = True
+        obj.reactor.run_callbacks()
+        assert pending.wait() is True
+        assert obj._td1_present is True
+        assert obj._td1_query_completion is None
+        obj.moonraker.check_for_td1.assert_not_called()
+
+    def test_unexpected_failure_keeps_cache_and_settles_pending(self, td1_owner):
+        obj = td1_owner
+        obj._td1_present = True
+        obj.moonraker.check_for_td1.side_effect = ValueError("bad presence")
+        assert obj.td1_present is True
+        pending = obj._td1_query_completion
+        obj.reactor.run_callbacks()
+        assert pending.wait() is True
+        assert obj._td1_present is True
+        assert obj._td1_query_completion is None
+        assert obj.logger.messages == [("error", "TD-1 presence refresh failed")]
+
+    @pytest.mark.parametrize("change", ["close", "replace"])
+    def test_client_change_during_lookup_discards_presence(self, td1_owner, change):
+        obj = td1_owner
+        client = obj.moonraker
+
+        def fetched():
+            if change == "close":
+                client._closing = True
+            else:
+                obj.moonraker = MagicMock()
+                obj.moonraker._closing = False
+            return True, True, False
+
+        client.check_for_td1.side_effect = fetched
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        obj.reactor.run_callbacks()
+        assert pending.wait() is False
+        assert obj._td1_present is False
+        assert obj._td1_query_completion is None
+        assert obj.logger.messages == []
+
+    def test_finishing_refresh_does_not_clear_a_newer_pending_slot(self, td1_owner):
+        obj = td1_owner
+        assert obj.td1_present is False
+        original = obj._td1_query_completion
+        replacement = obj.reactor.completion()
+        obj._td1_query_completion = replacement
+        obj.reactor.run_callbacks()
+        assert original.wait() is True
+        assert obj._td1_query_completion is replacement
+        assert not replacement.test()
+
+
+class TestCheckTd1Present:
+    def test_operational_wait_reuses_pending_status_refresh(self, td1_owner):
+        obj = td1_owner
+        assert obj.td1_present is False
+        pending = obj._td1_query_completion
+        original_wait = pending.wait
+
+        def dispatch_then_wait():
+            obj.reactor.run_callbacks()
+            return original_wait()
+
+        pending.wait = dispatch_then_wait
+        assert obj.check_td1_present() is True
+        obj.moonraker.check_for_td1.assert_called_once_with()
+
+    def test_ineligible_operation_returns_cached_state(self, td1_owner):
+        obj = td1_owner
+        obj._td1_present = True
+        obj.printer.state_message = "Startup"
+        assert obj.check_td1_present() is True
+        obj.moonraker.check_for_td1.assert_not_called()
 
 
 # ── cmd_TOOL_LOAD: lane_loaded guard ─────────────────────────────────────────
@@ -3235,25 +3257,26 @@ class TestInPrintReactorTimer:
     calling methods on it would raise AttributeError and crash klipper.
     """
 
-    def _make(self):
-        obj = _make_afc()
+    def _make(self, afc_connection):
+        obj, _ = afc_connection
+        obj.function = MagicMock()
         obj.in_print_timer = MagicMock()
         return obj
 
-    def test_skips_moonraker_call_when_moonraker_is_none(self):
+    def test_skips_moonraker_call_when_moonraker_is_none(self, afc_connection):
         """When in_print is True but moonraker is None, do not deref moonraker."""
-        obj = self._make()
+        obj = self._make(afc_connection)
         obj.moonraker = None
         obj.function.in_print.return_value = (True, "test.gcode")
         # Must not raise AttributeError on NoneType.
         result = obj.in_print_reactor_timer(0.0)
         assert result == obj.reactor.NEVER
 
-    def test_calls_moonraker_when_in_print_and_moonraker_set(self):
+    def test_calls_moonraker_when_in_print_and_moonraker_set(self, afc_connection):
         """Happy path: print_data_metadata is queried (async) when both
         in_print and moonraker are set; applying the result is deferred to
         the on_fetched callback, simulated here firing immediately."""
-        obj = self._make()
+        obj = self._make(afc_connection)
         obj.moonraker = MagicMock()
         obj.print_data_metadata = MagicMock()
         obj.print_data_metadata.tool_change_count = 7
@@ -3264,17 +3287,16 @@ class TestInPrintReactorTimer:
         obj.function.in_print.return_value = (True, "test.gcode")
         obj.function.get_current_lane_obj.return_value = None
         obj.in_print_reactor_timer(0.0)
-        obj.print_data_metadata.query_filename.assert_called_once_with(
-            "test.gcode", on_fetched=obj._finish_print_start)
+        assert obj.print_data_metadata.query_filename.call_args.args == ("test.gcode",)
         assert obj.number_of_toolchanges == 7
         assert obj.print_tool_temperatures == [210]
-        assert obj.current_toolchange == -1
+        assert obj.current_toolchange == 0
 
-    def test_toolchange_count_not_applied_until_on_fetched_fires(self):
+    def test_toolchange_count_not_applied_until_on_fetched_fires(self, afc_connection):
         """The metadata fetch is async: number_of_toolchanges must stay at
         its reset-to-0 value until the on_fetched callback actually runs, not
         just because query_filename() was called."""
-        obj = self._make()
+        obj = self._make(afc_connection)
         obj.moonraker = MagicMock()
         obj.print_data_metadata = MagicMock()
         obj.print_data_metadata.tool_change_count = 7
@@ -3291,11 +3313,11 @@ class TestInPrintReactorTimer:
 
         captured["on_fetched"]()
         assert obj.number_of_toolchanges == 7
-        assert obj.current_toolchange == -1
+        assert obj.current_toolchange == 0
 
-    def test_does_not_call_moonraker_when_not_in_print(self):
+    def test_does_not_call_moonraker_when_not_in_print(self, afc_connection):
         """When not in a print, print_data_metadata should not be queried."""
-        obj = self._make()
+        obj = self._make(afc_connection)
         obj.moonraker = MagicMock()
         obj.print_data_metadata = MagicMock()
         obj.function.in_print.return_value = (False, None)
@@ -3303,9 +3325,9 @@ class TestInPrintReactorTimer:
         assert not obj.print_data_metadata.method_calls
         assert obj.number_of_toolchanges == 0
 
-    def test_finish_print_start_skips_buffer_update_when_lane_has_no_buffer(self):
-        """Covers current_lane truthy but buffer_obj falsy in _finish_print_start."""
-        obj = self._make()
+    def test_timer_skips_buffer_update_when_lane_has_no_buffer(self, afc_connection):
+        """A lane without a buffer has no fault reference to initialize."""
+        obj = self._make(afc_connection)
         obj.moonraker = None
         current_lane = MagicMock()
         current_lane.buffer_obj = None
@@ -3315,21 +3337,94 @@ class TestInPrintReactorTimer:
         # Would raise AttributeError from None.update_filament_error_pos() if
         # the buffer_obj-is-None guard were missing
         obj.in_print_reactor_timer(0.0)
-        assert obj.current_toolchange == -1
+        assert obj.current_toolchange == 0
 
-    def test_skips_metadata_lookup_when_print_data_metadata_is_none(self):
+    def test_skips_metadata_lookup_when_print_data_metadata_is_none(self, afc_connection):
         """Covers the `self.print_data_metadata` half of
         `if self.moonraker is not None and self.print_data_metadata` being
         falsy while `self.moonraker` alone is truthy."""
-        obj = self._make()
+        obj = self._make(afc_connection)
         obj.moonraker = MagicMock()
         obj.print_data_metadata = None
         obj.function.in_print.return_value = (True, "test.gcode")
         obj.function.get_current_lane_obj.return_value = None
         result = obj.in_print_reactor_timer(0.0)
         assert obj.number_of_toolchanges == 0
-        assert obj.current_toolchange == -1
+        assert obj.current_toolchange == 0
         assert result == obj.reactor.NEVER
+
+
+class TestFinishPrintStart:
+    @pytest.mark.parametrize("change", ["progress", "file", "owner"])
+    @pytest.mark.parametrize("timer_present", [False, True])
+    def test_delayed_metadata_never_resets_progress_or_obsolete_print(
+        self, afc_connection, change, timer_present
+    ):
+        from extras.AFC_utils import AFC_PrintFileMetaData
+        obj, _ = afc_connection
+        obj.function = MagicMock()
+        obj.in_print_timer = object() if timer_present else None
+        obj.moonraker = MagicMock()
+        pending = []
+        obj.moonraker.get_file_metadata.side_effect = (
+            lambda filename, callback: pending.append(callback))
+        obj.print_data_metadata = AFC_PrintFileMetaData(obj.moonraker, obj.logger)
+        obj.function.in_print.return_value = (True, "same.gcode")
+        lane = MagicMock()
+        obj.function.get_current_lane_obj.return_value = lane
+        obj.in_print_reactor_timer(0.0)
+        lane.buffer_obj.update_filament_error_pos.assert_called_once_with()
+        obj.current_toolchange = 4
+        if change == "file":
+            obj.function.in_print.return_value = (True, "other.gcode")
+        elif change == "owner":
+            obj.print_data_metadata = AFC_PrintFileMetaData(obj.moonraker, obj.logger)
+        pending[0]({"filament_change_count": 9, "filament_temps": [210]})
+        assert obj.current_toolchange == 4
+        assert lane.buffer_obj.update_filament_error_pos.call_count == 1
+        assert obj.number_of_toolchanges == (9 if change == "progress" else 0)
+        assert obj.print_tool_temperatures == ([210] if change == "progress" else [])
+        assert obj.in_print_timer is None
+
+
+class TestResetFileCallbackTimerOwnership:
+    @pytest.mark.parametrize("existing", [False, True])
+    def test_replaces_pending_timer_at_file_boundary(self, afc_connection, existing):
+        obj, _ = afc_connection
+        old = object() if existing else None
+        replacement = object()
+        obj.in_print_timer = old
+        obj.reactor.register_timer = MagicMock(return_value=replacement)
+        obj.reactor.unregister_timer = MagicMock()
+        obj.current_toolchange = 4
+        obj._reset_file_callback()
+        assert obj.in_print_timer is replacement
+        assert obj.current_toolchange == -1
+        if existing:
+            obj.reactor.unregister_timer.assert_called_once_with(old)
+        else:
+            obj.reactor.unregister_timer.assert_not_called()
+
+    def test_file_reset_invalidates_pending_metadata_and_its_continuation(self, afc_connection):
+        from extras.AFC_utils import AFC_PrintFileMetaData
+        obj, _ = afc_connection
+        pending = []
+        finished = []
+        client = MagicMock()
+        client.get_file_metadata.side_effect = (
+            lambda filename, callback: pending.append(callback))
+        metadata = obj.print_data_metadata = AFC_PrintFileMetaData(client, obj.logger)
+        metadata.query_filename("same.gcode", lambda: finished.append("obsolete"))
+        obj._reset_file_callback()
+        assert metadata.filename == ""
+        assert metadata._metadata == {}
+        assert metadata._query_generation == 2
+        pending[0]({"filament_change_count": 99, "filament_temps": [299]})
+        assert metadata._metadata == {}
+        assert finished == []
+        assert obj.number_of_toolchanges == 0
+        assert obj.current_toolchange == -1
+        assert obj.print_tool_temperatures == []
 
 
 # cmd_LANE_MOVE
@@ -5223,3 +5318,59 @@ class TestAFCInit:
         assert io.startup_reads == 0
         assert io.records == []
         assert io.logger.messages == []
+
+
+class TestAFCResetStatsBackupOrder:
+    @pytest.mark.parametrize("failed", [False, True])
+    def test_backup_finishes_before_counters_reset(self, afc_connection, failed):
+        from extras.AFC_stats import AFCStats_var
+        obj, io = afc_connection
+        obj.moonraker = io.client
+        obj.reactor = io.reactor
+        lane = MagicMock()
+        lane.name = "lane1"
+        lane.lane_load_count = AFCStats_var(
+            "lane1", "load_count", {"lane1": {"load_count": 7}}, io.client)
+        obj.lanes = {"lane1": lane}
+        io.responses[0] = {"backup_path": "/tmp/afc-backup.db"}
+        if failed:
+            io.statuses[0] = 500
+        gate = io.gates[0] = threading.Event()
+        observed = []
+        observer_errors = []
+
+        def inspect_held_backup():
+            try:
+                io.wait_requests(1)
+                observed.append((lane.lane_load_count.value, obj.db_backup))
+            except BaseException as error:
+                observer_errors.append(error)
+            finally:
+                gate.set()
+
+        observer = threading.Thread(target=inspect_held_backup)
+        observer.start()
+        try:
+            obj.cmd_AFC_RESET_STATS(_build_gcmd({"LANE": "lane1"}))
+        finally:
+            gate.set()
+            observer.join(5)
+        assert not observer.is_alive()
+        assert observer_errors == []
+        assert observed == [(7, False)]
+        assert lane.lane_load_count.value == (7 if failed else 0)
+        assert obj.db_backup is (not failed)
+        io.wait_idle()
+        io.reactor.run_callbacks()
+        assert io.requests[0][0] == "/server/database/backup"
+        if failed:
+            assert io.logger.messages == [
+                ("error", "Error trying to backup moonraker database, "
+                 "check AFC.log for more information"),
+                ("error", io.client.ERROR_STRING),
+            ]
+        else:
+            assert io.logger.messages == [
+                ("info", "Moonrakers database backed up to /tmp/afc-backup.db"),
+                ("info", "Lane stats reset for lane1"),
+            ]

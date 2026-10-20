@@ -305,6 +305,12 @@ class TestSelectorCalDis:
         assert lane.selector_cal_dis == 1.5
 
 
+class TestAFCLaneSpoolRequestGenerationInit:
+    def test_constructor_has_no_pending_spool_assignment(self):
+        lane = _make_real_afc_lane()
+        assert lane._spool_request_generation == 0
+
+
 # ── _get_steppers: stepperless unit early return ─────────────────────────────
 # New branch: stepperless units (e.g. OpenAMS) have no drive stepper to set up,
 # so _get_steppers returns immediately after resolving the unit object.
@@ -572,7 +578,7 @@ class TestGetTd1DataUnitHook:
 class TestGetTd1DataLoad:
     def _make(self, td1_present=True, td1_device_id="SN1"):
         lane = _make_afc_lane()
-        lane.afc.td1_present = td1_present
+        lane.afc.check_td1_present.return_value = td1_present
         lane.td1_device_id = td1_device_id
         lane.afc.moonraker = MagicMock()
         return lane
@@ -1252,6 +1258,55 @@ class TestAFCLaneMaterial:
         """'PLA+' should match 'PLA' entry."""
         lane = _make_lane_with_afc()
         lane.material = "PLA+"
+        assert lane.filament_density == 1.24
+
+    @pytest.mark.parametrize("material, densities", [
+        ({"PLA": True}, ["PLA:1.24"]),
+        ("PLA", ["PLA:broken"]),
+    ])
+    def test_invalid_material_density_does_not_partially_change_material(
+        self, material, densities
+    ):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = densities
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        with pytest.raises(ValueError):
+            lane.material = material
+        assert lane.material == "PETG"
+        assert lane.filament_density == 1.27
+
+
+class TestAFCLaneGetMaterialDensity:
+    @pytest.mark.parametrize("value, expected", [
+        (None, 1.24), ("", 1.24), ("PETG", 1.27), ("NYLON", 1.31),
+    ])
+    def test_preflight_returns_density_without_assignments(self, value, expected):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.24", "PETG:1.27"]
+        lane._material = "OLD"
+        lane.filament_density = 1.31
+        assert lane._get_material_density(value) == expected
+        assert lane.material == "OLD"
+        assert lane.filament_density == 1.31
+
+    @pytest.mark.parametrize("value", [True, 7, {}, ["PLA"]])
+    def test_non_text_material_is_rejected_before_assignments(self, value):
+        lane = _make_real_afc_lane()
+        lane._material = None
+        lane.filament_density = 1.24
+        with pytest.raises(ValueError, match="^Filament material must be text or None$"):
+            lane._get_material_density(value)
+        assert lane.material is None
+        assert lane.filament_density == 1.24
+
+    def test_first_material_match_wins(self):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.25", "PLA+:1.29"]
+        lane._material = None
+        lane.filament_density = 1.24
+        assert lane._get_material_density("PLA+") == 1.25
+        assert lane.material is None
         assert lane.filament_density == 1.24
 
 
@@ -3946,6 +4001,14 @@ class TestPrepCallback:
         from an NFC scan). The on_done callback passed to _set_values must
         re-push using the settled spool_id, and must not fire eagerly."""
         lane = _make_lane_ready_to_load()
+        from tests.test_AFC_spool import _make_spool
+        spool = _make_spool()
+        spool.afc = lane.afc
+        spool._set_values = MagicMock()
+        spool.set_active_spool = MagicMock()
+        lane.afc.spool = spool
+        lane.afc.lanes = {lane.name: lane}
+        lane.afc.current = lane.name
         lane.hub = "direct_load"
         lane.afc.TOOL_LOAD.return_value = True
         lane.prep_callback(10, True)

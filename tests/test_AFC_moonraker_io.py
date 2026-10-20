@@ -21,12 +21,41 @@ from tests.conftest import MockLogger, MockReactor
 WAIT = 5
 
 
+class EventCompletion:
+    """Bounded unit bridge. Real cooperative scheduling is tested by the smoke script."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+
+    def complete(self, result):
+        assert not self.event.is_set(), "completion delivered twice"
+        self.result = result
+        self.event.set()
+
+    def test(self):
+        return self.event.is_set()
+
+    def wait(self):
+        assert self.event.wait(WAIT), "worker did not settle result"
+        return self.result
+
+
 class DeferredReactor(MockReactor):
     def __init__(self):
         super().__init__()
         self.callbacks = Queue()
 
+    def completion(self):
+        return EventCompletion()
+
+    def async_complete(self, completion, result):
+        completion.complete(result)
+
     def register_async_callback(self, callback, waketime=None):
+        self.callbacks.put(callback)
+
+    def register_callback(self, callback, waketime=None):
         self.callbacks.put(callback)
 
     def run_callbacks(self):
@@ -78,6 +107,7 @@ class LoopbackIO:
         self.contents = {}
         self.statuses = {}
         self.responses = {}
+        self.raw_responses = {}
         self.gates = {}
         self.escaped = []
         self.condition = threading.Condition()
@@ -106,7 +136,7 @@ class LoopbackIO:
                 body = self.rfile.read(length).decode()
                 if self.headers.get("Content-Type") == "application/json":
                     form = {}
-                    data = json.loads(body)
+                    data = json.loads(body) if body else {}
                 else:
                     form = parse_qs(body)
                     data = None
@@ -129,7 +159,8 @@ class LoopbackIO:
                     elif self.command == "DELETE":
                         owner.contents.pop((namespace, key), None)
                 result = owner.responses.get(index, {"value": value})
-                payload = json.dumps({"result": result}).encode()
+                payload = owner.raw_responses.get(
+                    index, json.dumps({"result": result}).encode())
                 try:
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
@@ -590,3 +621,152 @@ class TestAFCMoonrakerSendLaneData:
             gate.set()
         io.wait_idle()
         assert io.logger.messages == []
+
+
+class TestAFCMoonrakerResultBridge:
+    def test_get_runs_on_fifo_worker_and_delivers_result(self, moonraker_io):
+        io = moonraker_io
+        io.responses[0] = {"ready": True}
+        workers = []
+        from urllib.request import urlopen
+
+        def observed_open(*args, **kwargs):
+            workers.append(threading.get_ident())
+            return urlopen(*args, **kwargs)
+
+        with patch("extras.AFC_utils.urlopen", side_effect=observed_open):
+            result = io.client._get_results(io.client.host + "/server/info")
+        assert result == {"ready": True}
+        assert workers == [io.client._write_thread.ident]
+        assert io.requests == [("/server/info", {}, None)]
+        assert io.logger.messages == []
+
+    @pytest.mark.parametrize("body", [b"not-json", b"{}", b"[]"])
+    def test_bad_envelope_settles_callback_and_later_work(self, moonraker_io, body):
+        io = moonraker_io
+        io.raw_responses[0] = body
+        results = []
+        io.client.get_file_metadata("bad.gcode", results.append)
+        io.client.update_afc_stats("after", 2)
+        io.wait_idle()
+        io.reactor.run_callbacks()
+        assert results == [None]
+        assert io.contents[("afc_stats", "after")] == "2"
+        assert io.logger.messages == [("error", io.client.ERROR_STRING)]
+
+    def test_closed_result_request_is_rejected(self, moonraker_io):
+        io = moonraker_io
+        io.client.join_thread()
+        with pytest.raises(RuntimeError, match="^AFC Moonraker worker is closed$"):
+            io.client._get_results(io.client.host + "/server/info")
+        assert io.records == []
+
+    def test_worker_exception_is_raised_to_waiter_and_queue_continues(self, moonraker_io):
+        io = moonraker_io
+
+        def fail():
+            raise ValueError("worker failure")
+
+        with pytest.raises(ValueError, match="^worker failure$"):
+            io.client._call_worker(fail, ())
+        io.client.update_afc_stats("after", 3)
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "after"): "3"}
+        assert io.logger.messages == []
+
+    @pytest.mark.parametrize("result", [False, None, {}, [], 0])
+    def test_valid_false_results_keep_their_meaning(self, moonraker_io, result):
+        io = moonraker_io
+        io.responses[0] = result
+        assert io.client._get_results(io.client.host + "/server/info") == result
+        assert io.logger.messages == []
+
+    def test_mixed_reads_and_writes_share_fifo_without_self_wait(self, moonraker_io):
+        io = moonraker_io
+        io.responses[2] = {"filament_change_count": 3}
+        io.responses[3] = {"id": 42}
+        io.responses[4] = {"devices": {"serial": {"color": "red"}}}
+        io.responses[5] = {"ready": True}
+        callbacks = []
+        io.client.update_afc_stats("first", 1)
+        io.client.remove_database_entry("afc_stats", "old")
+        io.client.get_file_metadata("file.gcode",
+                                    lambda value: callbacks.append(("meta", value)))
+        io.client.get_spool(42, lambda value: callbacks.append(("spool", value)))
+        io.client.get_td1_data_async(lambda value: callbacks.append(("td1", value)))
+        assert io.client._get_results(io.client.host + "/server/info") == {"ready": True}
+        io.client.send_lane_data({"lane": "red"})
+        io.wait_idle()
+        io.reactor.run_callbacks()
+        assert [request[0] for request in io.requests] == [
+            "/server/database/item", "/server/database/item",
+            "/server/files/metadata?filename=file.gcode", "/server/spoolman/proxy",
+            "/machine/td1/data", "/server/info", "/server/database/item",
+        ]
+        assert callbacks == [
+            ("meta", {"filament_change_count": 3}), ("spool", {"id": 42}),
+            ("td1", {"serial": {"color": "red"}}),
+        ]
+        assert io.logger.messages == [("debug", "Removing old from afc_stats")]
+
+
+class TestAFCMoonrakerCallbackClose:
+    @pytest.mark.parametrize("submit", [
+        lambda client, callback: client.get_file_metadata("old.gcode", callback),
+        lambda client, callback: client.get_spool(42, callback),
+        lambda client, callback: client.get_td1_data_async(callback),
+    ])
+    def test_queued_delivery_is_discarded_after_close(self, moonraker_io, submit):
+        io = moonraker_io
+        results = []
+        submit(io.client, results.append)
+        io.wait_idle()
+        io.client.join_thread()
+        io.reactor.run_callbacks()
+        assert results == []
+
+
+class TestAFCMoonrakerLanePayload:
+    def test_admitted_payload_is_immutable(self, moonraker_io):
+        io = moonraker_io
+        gate = io.gates[0] = threading.Event()
+        io.client.update_afc_stats("barrier", 1)
+        io.wait_requests(1)
+        data = {"lane1": {"color": "red"}}
+        io.client.send_lane_data(data)
+        data["lane1"]["color"] = "blue"
+        try:
+            assert len(io.requests) == 1
+        finally:
+            gate.set()
+        io.wait_idle()
+        assert io.requests[1] == (
+            "/server/database/item", {}, {"lane1": {"color": "red"}})
+
+
+class TestAFCMoonrakerCleanupPublicationOrder:
+    def test_cleanup_deletes_precede_lane_publication(self, moonraker_io):
+        io = moonraker_io
+        io.responses[0] = {"value": {"old1": {}, "old2": {}}}
+        gate = io.gates[1] = threading.Event()
+        io.client.delete_lane_data()
+        io.wait_requests(2)
+        io.client.send_lane_data({"lane1": {"color": "red"}})
+        try:
+            assert len(io.requests) == 2
+            assert io.escaped == []
+        finally:
+            gate.set()
+        io.wait_idle()
+        assert io.records == [
+            ("GET", "", "", None),
+            ("DELETE", "lane_data", "old1", None),
+            ("DELETE", "lane_data", "old2", None),
+            ("POST", "", "", None),
+        ]
+        assert io.requests[-1][2] == {"lane1": {"color": "red"}}
+        io.reactor.run_callbacks()
+        assert io.logger.messages == [
+            ("debug", "Removing old1 from lane_data"),
+            ("debug", "Removing old2 from lane_data"),
+        ]

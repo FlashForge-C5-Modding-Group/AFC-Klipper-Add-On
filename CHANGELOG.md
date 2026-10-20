@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   even if an earlier request fails. Remaining errors are recorded without calling the stopped UI.
   This does not guarantee durable delivery or a fixed shutdown deadline.
 - Statistics migration deletes use the same socket timeout as other Moonraker requests.
+- Remaining Moonraker HTTP requests run on the existing FIFO worker. Result-dependent
+  startup, backup, and TD-1 operations wait cooperatively while reactor callbacks continue.
+  Statistics, lane publication, and callback-based reads remain asynchronous.
+- Lane publication captures its JSON before queue admission, preserving submitted values
+  and cleanup-before-publication ordering.
+- TD-1 status reads return cached presence while sharing a deferred refresh with operations
+  that need fresh presence. Closed or replaced clients cannot apply delayed state.
+- Delayed print metadata cannot restart obsolete print bookkeeping, reset tool-change progress,
+  or move the buffer fault reference after print-start initialization.
+- Delayed spool lookups cannot overwrite newer assignments or manual filament changes,
+  claim an already-assigned spool, or activate rejected assignments. Malformed spool material
+  and density data leave the prior filament fields intact.
 
 ## [10-16-2026]
 ### Added

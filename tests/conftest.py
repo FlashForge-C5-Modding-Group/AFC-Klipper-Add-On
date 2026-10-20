@@ -598,6 +598,9 @@ class MockAFC:
         self.snapmaker_printer = False
         self.enable_multiple_mapping = False
 
+    def check_td1_present(self):
+        return self.td1_present
+
 
 class MockPrinter:
     """Mock for Klipper's printer object."""

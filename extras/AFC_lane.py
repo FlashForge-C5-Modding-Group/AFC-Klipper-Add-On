@@ -99,6 +99,11 @@ class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
     PREP_GUARD_WINDOW = 2.0  # seconds
     def __init__(self, config: ConfigWrapper) -> None:
+        """
+        Initialize a lane and its filament assignment ownership state.
+
+        :param config: Lane configuration section
+        """
         self._config            = config
         self.printer            = config.get_printer()
         self.afc: afc           = self.printer.load_object(config, 'AFC')
@@ -126,13 +131,14 @@ class AFCLane:
         self.tool_loaded        = False
         self.loaded_to_hub      = False
         self.spool_id: Optional[Union[int, str]] = None
+        self._spool_request_generation = 0
         self.color: str         = ""
         self.multi_color: list  = []
         self.spool_vendor: str  = ""
         self.filament_name: str = ""
         self.weight: float      = 0.
         self.auto_switch_triggered: bool = False
-        self._material: str     = None
+        self._material: Optional[str] = None
         self.extruder_temp: Optional[int] = None
         self.bed_temp: Optional[int] = None
         self.td1_data           = {}
@@ -438,30 +444,43 @@ class AFCLane:
         return self._lookup_endstop(AFCHomingPoints.TOOL)
 
     @property
-    def material(self):
+    def material(self) -> Optional[str]:
         """
-        Returns lanes filament material type
+        Return the lane's current filament material.
 
-        :return str: Current filament material type for the lane
+        :return Optional[str]: Current material, or None when unset
         """
         return self._material
 
     @material.setter
-    def material(self, value):
+    def material(self, value: Optional[str]) -> None:
         """
-        Sets filament material type and sets filament density based off material type.
-        To use custom density, set density after setting material
-        """
-        self._material = value
-        if not value:
-            self.filament_density = 1.24 # Setting to a default value
-            return
+        Set material and its configured density only after validating both.
 
+        :param value: Material name, or None to clear it
+        """
+        density = self._get_material_density(value)
+        self._material = value
+        self.filament_density = density
+
+    def _get_material_density(self, value: Optional[str]) -> Optional[float]:
+        """
+        Resolve material density without changing the lane's filament fields.
+
+        :param value: Material name, or None to use the default density
+        :return Optional[float]: First matching density, or the current density
+        """
+        if (value is not None
+            and not isinstance(value, str)):
+            error_message = "Filament material must be text or None"
+            raise ValueError(error_message)
+        if not value:
+            return 1.24
         for density in self.afc.common_density_values:
-            v = density.split(":")
-            if v[0] in value:
-                self.filament_density = float(v[1])
-                break
+            parts = density.split(":")
+            if parts[0] in value:
+                return float(parts[1])
+        return self.filament_density
 
     @property
     def lane_index(self) -> str:
@@ -1326,14 +1345,11 @@ class AFCLane:
                                 self.logger.debug(f"Prep: direct load logic-{self.name}-{self.hub}")
                                 if not self.afc.TOOL_LOAD(self):
                                     self.afc.afc_stats.increase_load_error_count(self.afc)
-                                # TOOL_LOAD already pushed the active spool to Spoolman using
-                                # whatever spool_id was set before this point. _set_values can
-                                # still be waiting on an async Spoolman fetch (from a next_spool_id
-                                # set by e.g. an NFC scan) that updates spool_id afterward, so
-                                # re-push once that settles rather than leaving Spoolman pointed
-                                # at the stale value TOOL_LOAD saw.
+                                # Only a current completed assignment may refresh the active spool.
                                 self.afc.spool._set_values(
-                                    self, on_done=lambda: self.afc.spool.set_active_spool(self.spool_id))
+                                    self,
+                                    on_done=lambda: self.afc.spool._update_active_spool_if_current(
+                                        self))
                                 self.logger.debug(f"Prep: direct load logic done-{self.name}-{self.hub}")
                                 break
 
@@ -1971,7 +1987,7 @@ class AFCLane:
         Fetches TD-1 data asynchronously since this runs at the end of every TOOL_LOAD
         and can't block on the HTTP round trip during a print.
         """
-        if not self.afc.td1_present:
+        if not self.afc.check_td1_present():
             return
         if not self.td1_device_id:
             return

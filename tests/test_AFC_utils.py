@@ -460,7 +460,7 @@ class TestAFCMoonraker:
     def test_get_results_connection_error_returns_none(self):
         mr = self._make_moonraker()
         with patch("extras.AFC_utils.urlopen", side_effect=Exception("connection refused")):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
 
     def test_get_results_status_above_300_returns_none(self):
@@ -482,7 +482,7 @@ class TestAFCMoonraker:
         # list, in order, not just membership, per the repository test contract.
         messages_before = len(mr.logger.messages)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
         assert mr.logger.messages[messages_before:] == [
             ("debug", mr.ERROR_STRING),
@@ -500,7 +500,7 @@ class TestAFCMoonraker:
         mock_resp.__exit__ = MagicMock(return_value=False)
         messages_before = len(mr.logger.messages)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
         assert mr.logger.messages[messages_before:] == [
             ("debug", mr.ERROR_STRING),
@@ -516,7 +516,7 @@ class TestAFCMoonraker:
         mock_resp.__exit__ = MagicMock(return_value=False)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp), \
              patch("extras.AFC_utils.json.load", return_value=payload):
-            result = mr._get_results("http://localhost:7125/server/info")
+            result = mr._get_results_sync("http://localhost:7125/server/info")
         assert result == {"state": "ready"}
 
     def test_check_and_return_helper(self):
@@ -529,7 +529,7 @@ class TestAFCMoonraker:
     def test_update_afc_stats_sync_logs_on_failure(self):
         mr = self._make_moonraker()
         init_messages = list(mr.logger.messages)
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         mr._update_afc_stats_sync("some.key", 10)
         assert mr.logger.messages == init_messages + [
             ("error", "Error when trying to update some.key in moonraker, see AFC.log for more info"),
@@ -538,14 +538,14 @@ class TestAFCMoonraker:
     def test_update_afc_stats_sync_no_error_on_success(self):
         mr = self._make_moonraker()
         init_messages = list(mr.logger.messages)
-        mr._get_results = MagicMock(return_value={"value": "ok"})
+        mr._get_results_sync = MagicMock(return_value={"value": "ok"})
         mr._update_afc_stats_sync("some.key", 10)
         assert mr.logger.messages == init_messages
 
 
     def test_get_spool_sync_not_found_logs_info(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_spool_sync(42, callback)
         callback.assert_called_once_with(None)
@@ -555,14 +555,14 @@ class TestAFCMoonraker:
 
     def test_get_file_metadata_sync_returns_resp_when_found(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"filament_change_count": 3})
+        mr._get_results_sync = MagicMock(return_value={"filament_change_count": 3})
         callback = MagicMock()
         mr._get_file_metadata_sync("test.gcode", callback)
         callback.assert_called_once_with({"filament_change_count": 3})
 
     def test_get_file_metadata_sync_returns_none_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_file_metadata_sync("test.gcode", callback)
         callback.assert_called_once_with(None)
@@ -570,9 +570,9 @@ class TestAFCMoonraker:
     def test_get_file_metadata_sync_queries_correct_url(self):
         from urllib.parse import urljoin, quote
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         mr._get_file_metadata_sync("sub dir/test file.gcode", MagicMock())
-        queried_url = mr._get_results.call_args[0][0]
+        queried_url = mr._get_results_sync.call_args[0][0]
         expected_url = urljoin(
             mr.host, f"{mr.FILENAME_PATH}{quote('sub dir/test file.gcode')}")
         assert queried_url == expected_url
@@ -694,21 +694,21 @@ class TestAFCMoonraker:
 
     def test_get_td1_data_async_sync_returns_devices_on_success(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"devices": {"SN123": {}}})
+        mr._get_results_sync = MagicMock(return_value={"devices": {"SN123": {}}})
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with({"SN123": {}})
 
     def test_get_td1_data_async_sync_returns_none_when_no_devices_key(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"other": "data"})
+        mr._get_results_sync = MagicMock(return_value={"other": "data"})
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with(None)
 
     def test_get_td1_data_async_sync_returns_none_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with(None)
@@ -732,15 +732,15 @@ class TestAFCMoonraker:
 
     def test_send_lane_data_sync_logs_error_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._get_results_sync = MagicMock(return_value=None)
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) == 1
 
     def test_send_lane_data_sync_success_no_error(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"value": "ok"})
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._get_results_sync = MagicMock(return_value={"value": "ok"})
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) == 0
 
@@ -800,7 +800,7 @@ class TestAFCMoonraker:
 
     def test_get_spool_sync_returns_resp_when_found(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"id": 42, "name": "PLA"})
+        mr._get_results_sync = MagicMock(return_value={"id": 42, "name": "PLA"})
         callback = MagicMock()
         mr._get_spool_sync(42, callback)
         callback.assert_called_once_with({"id": 42, "name": "PLA"})
@@ -901,10 +901,10 @@ class TestAFCMoonraker:
         """HTTPError propagated from _get_results."""
         from urllib.error import HTTPError
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(
+        mr._get_results_sync = MagicMock(
             side_effect=HTTPError(None, 500, "Internal Server Error", {}, None)
         )
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) >= 1
 
@@ -1056,6 +1056,56 @@ class TestAFCPrintFileMetaDataFilename:
         meta.query_filename("second.gcode")
         assert meta.tool_change_count == 7
         assert meta.tool_temperatures == [220]
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_same_filename_restart_discards_old_response_and_continuation(self, reset):
+        meta, moonraker = _make_print_file_metadata()
+        pending = []
+        finished = []
+        moonraker.get_file_metadata.side_effect = (
+            lambda filename, callback: pending.append(callback))
+        meta.query_filename("same.gcode", lambda: finished.append("old"))
+        if reset:
+            meta.reset()
+        meta.query_filename("same.gcode", lambda: finished.append("new"))
+        pending[0]({"filament_change_count": 99, "filament_temps": [299]})
+        assert meta._metadata == {}
+        assert finished == []
+        pending[1]({"filament_change_count": 3, "filament_temps": [210]})
+        assert meta.tool_change_count == 3
+        assert meta.tool_temperatures == [210]
+        assert finished == ["new"]
+
+    def test_starting_query_clears_previous_cached_values(self):
+        meta, moonraker = _make_print_file_metadata()
+        _stub_get_file_metadata(moonraker, {"filament_change_count": 9})
+        meta.query_filename("old.gcode")
+        moonraker.get_file_metadata.side_effect = None
+        meta.query_filename("next.gcode")
+        assert meta._metadata == {}
+
+
+class TestAFCPrintFileMetaDataApplyMetadata:
+    @pytest.mark.parametrize("generation, filename", [
+        (0, "active.gcode"), (1, "obsolete.gcode"),
+    ])
+    def test_rejected_owner_does_not_cache_or_continue(self, generation, filename):
+        meta, _ = _make_print_file_metadata()
+        meta.query_filename("active.gcode")
+        finished = []
+        meta._apply_metadata(generation, filename, {"filament_change_count": 99},
+                             lambda: finished.append("obsolete"))
+        assert meta._metadata == {}
+        assert finished == []
+
+    @pytest.mark.parametrize("response", [None, {}, {"filament_change_count": 3}])
+    def test_active_response_settles_current_continuation(self, response):
+        meta, _ = _make_print_file_metadata()
+        meta.query_filename("active.gcode")
+        finished = []
+        meta._apply_metadata(1, "active.gcode", response, lambda: finished.append("current"))
+        assert meta._metadata == (response or {})
+        assert finished == ["current"]
 
 
 class TestAFCPrintFileMetaDataToolChangeCount:
