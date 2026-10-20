@@ -118,9 +118,16 @@ class AFCEspoolerStats:
     espooler_obj:
         Espooler object to easily get access to logger and moonraker objects
     """
-    def __init__(self, espooler_name: str, espooler_obj: Espooler):
+    def __init__(self, espooler_name: str, espooler_obj: Espooler) -> None:
+        """
+        Initialize runtime tracking for an espooler's statistics.
+
+        :param espooler_name: Lane name used for persisted runtime statistics.
+        :param espooler_obj: Espooler owning these statistics.
+        """
         self.espooler_name = espooler_name
         self.espooler_obj = espooler_obj
+        self._stats_initialized = False
         self._n20_runtime_fwd   = 0
         self._n20_runtime_rwd   = 0
         self._fwd_updated       = False
@@ -131,16 +138,20 @@ class AFCEspoolerStats:
         self._delta             = None
         self.logger = espooler_obj.logger
 
-    def handle_moonraker_stats(self):
+    def handle_moonraker_stats(self) -> None:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Load runtime statistics once, allowing failed initialization to retry.
         """
+        if self._stats_initialized:
+            return
+
         values = self.espooler_obj.afc.moonraker.get_afc_stats()
 
-        self._n20_runtime_fwd   = AFCStats_var(self.espooler_name, "n20_runtime_fwd", values, self.espooler_obj.afc.moonraker)
-        self._n20_runtime_rwd   = AFCStats_var(self.espooler_name, "n20_runtime_rwd", values, self.espooler_obj.afc.moonraker)
+        self._n20_runtime_fwd = AFCStats_var(
+            self.espooler_name, "n20_runtime_fwd", values, self.espooler_obj.afc.moonraker)
+        self._n20_runtime_rwd = AFCStats_var(
+            self.espooler_name, "n20_runtime_rwd", values, self.espooler_obj.afc.moonraker)
+        self._stats_initialized = True
 
 
     def _convert_value(self, value:int) -> tuple[int, str]:

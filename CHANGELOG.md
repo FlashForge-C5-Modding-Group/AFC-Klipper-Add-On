@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2026-10-20]
+### Fixed
+- Repeating `PREP` retains the current statistics and unsent espooler runtime.
+  Restart Klippy to reload counters edited externally in Moonraker.
+- Disconnect attempts admitted Moonraker work once in FIFO order before stopping the worker,
+  even if an earlier request fails. Remaining errors are recorded without calling the stopped UI.
+  This does not guarantee durable delivery or a fixed shutdown deadline.
+- Statistics migration deletes use the same socket timeout as other Moonraker requests.
+
 ## [10-16-2026]
 ### Added
 - Added support for Isik Techs new OWLFC MCU board for NightOwl units

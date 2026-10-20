@@ -83,7 +83,12 @@ def load_config(config):
 
 class afc:
     class sentinel: pass
-    def __init__(self, config: ConfigWrapper):
+    def __init__(self, config: ConfigWrapper) -> None:
+        """
+        Initialize AFC configuration, services, and statistics ownership.
+
+        :param config: AFC configuration section.
+        """
         self.config  = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -116,6 +121,7 @@ class afc:
         self.position_saved     = False
         self.spoolman           = None
         self.moonraker: Optional[AFC_moonraker] = None
+        self.afc_stats: Optional[AFCStats] = None
         self.print_data_metadata : Optional[AFC_PrintFileMetaData] = None
         self.td1_defined        = False
         self._td1_present       = False
@@ -413,16 +419,17 @@ class afc:
         if lane_obj.unit_obj.type != "ViViD":
             self.gcode.register_mux_command('HUB_LOAD',     "LANE", lane_obj.name, self.cmd_HUB_LOAD,       desc=self.cmd_HUB_LOAD_help)
 
-    def handle_moonraker_connect(self):
+    def handle_moonraker_connect(self) -> Optional[bool]:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Prepare Moonraker services while retaining initialized statistics.
+
+        :return Optional[bool]: False when Moonraker is not ready, otherwise None.
         """
 
         try:
-            self.moonraker = AFC_moonraker(self.moonraker_host, self.moonraker_port, self.logger,
-                                           self.reactor)
+            if self.moonraker is None:
+                self.moonraker = AFC_moonraker(
+                    self.moonraker_host, self.moonraker_port, self.logger, self.reactor)
             if not self.moonraker.wait_for_moonraker(toolhead=self.toolhead,
                                                      timeout=self.moonraker_connect_to):
                 return False
@@ -440,13 +447,15 @@ class afc:
 
                     self.toolhead.dwell(1)
             self.td1_defined, self._td1_present, self.lane_data_enabled = self.moonraker.check_for_td1()
-            self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
+            if self.afc_stats is None:
+                self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
             self.print_data_metadata = AFC_PrintFileMetaData(moonraker=self.moonraker,
                                                              logger=self.logger)
 
             self.printer.send_event("afc:moonraker_connect")
         except Exception as e:
-            self.logger.debug("Moonraker/Spoolman/afc_stats/td1 error\nError: {}\n{}".format(e, traceback.format_exc()))
+            self.logger.debug(
+                f"Moonraker/Spoolman/afc_stats/td1 error\nError: {e}\n{traceback.format_exc()}")
             self.spoolman = None                      # set to none if not found
 
     def handle_connect(self):

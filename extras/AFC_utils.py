@@ -16,7 +16,7 @@ import threading
 import chelper
 
 from datetime import datetime
-from queue import Queue
+from queue import Empty, Queue
 from urllib.request import (
     Request,
     urlopen
@@ -446,6 +446,8 @@ class AFC_moonraker:
     sentinel: object = object()
     def __init__(self, host: str, port: str, logger: AFC_logger, reactor: Reactor) -> None:
         """
+        Initialize the FIFO Moonraker worker and its reactor-owned diagnostics.
+
         :param host: Moonraker host address, e.g. http://localhost
         :param port: Port to connect to moonrakers localhost
         :param logger: AFC logger object to log and print to console
@@ -467,47 +469,77 @@ class AFC_moonraker:
         # Fire-and-forget writes (stat updates, lane_data pushes, database
         # deletes) run on this background thread so a slow/hung moonraker
         # can't stall the reactor. A single worker keeps them ordered.
-        self._write_thread_wait = True
-        self._write_queue: Queue[tuple[Any, Any]] = Queue()
+        self._closing = False
+        self._pending_logs: Queue[tuple[Callable[..., Any], str, dict[str, Any]]] = Queue()
+        self._write_queue: Queue[tuple[Any, tuple[Any, ...]]] = Queue()
         self._write_thread = threading.Thread(target=self._write_worker, daemon=True,
                                               name="afc_moonraker")
         self._write_thread.start()
 
     def _log_async(self, log_fn: Callable[..., Any], message: str, **kwargs: Any) -> None:
         """
-        Schedules a logger call to run on the reactor thread via
-        register_async_callback. AFC_logger touches gcode/webhooks state that
-        isn't safe to call from the background writer thread, and this is also
-        safe to call from the main/reactor thread, so _get_results uses it
-        for every log call regardless of which thread it's running on.
+        Queue a diagnostic and schedule reactor-thread delivery while open.
 
-        :param log_fn: Bound AFC_logger method to call (e.g. self.logger.error)
+        :param log_fn: Bound AFC_logger method to call (debug, info, or error)
         :param message: Message to log
+        :param kwargs: Keyword arguments passed to the AFC logger method
         """
-        self.reactor.register_async_callback(
-            lambda et, log_fn=log_fn, message=message, kwargs=kwargs: log_fn(message, **kwargs))
+        self._pending_logs.put_nowait((log_fn, message, kwargs))
+        if not self._closing:
+            self.reactor.register_async_callback(self._drain_logs)
+
+    def _drain_logs(self, eventtime: Optional[float] = None, *, shutdown: bool = False) -> None:
+        """
+        Deliver queued diagnostics once, without AFC console calls at shutdown.
+
+        :param eventtime: Reactor callback time, unused
+        :param shutdown: Use only the thread-safe file logger after worker cleanup
+        """
+        while True:
+            try:
+                log_fn, message, kwargs = self._pending_logs.get_nowait()
+            except Empty:
+                return
+            if shutdown:
+                trace = kwargs.get("traceback")
+                if trace is not None:
+                    message = f"{message}\n{trace}"
+                getattr(self.logger.logger, log_fn.__name__)(message)
+            else:
+                log_fn(message, **kwargs)
+
+    def _enqueue(self, func: Callable[..., Any], args: tuple[Any, ...]) -> None:
+        """
+        Admit an operation from the reactor thread while the worker is open.
+
+        :param func: Operation to execute on the worker
+        :param args: Positional arguments for the operation
+        """
+        if self._closing:
+            error_message = "AFC Moonraker worker is closed"
+            raise RuntimeError(error_message)
+        self._write_queue.put_nowait((func, args))
 
     def join_thread(self) -> None:
         """
-        Stops worker thread when klipper:disconnect happens
+        Close admission and attempt admitted work before disconnect returns.
         """
-        self._write_queue.put_nowait((self.sentinel, ""))
-        self._write_thread_wait = False
+        if not self._closing:
+            self._closing = True
+            self._write_queue.put_nowait((self.sentinel, ()))
         self._write_thread.join()
+        self._drain_logs(shutdown=True)
 
     def _write_worker(self) -> None:
         """
-        Background thread loop that drains queued fire-and-forget moonraker
-        requests (stat updates, lane_data pushes, database deletes) in the
-        order they were queued. Runs for the life of the process (daemon
-        thread) so it needs no explicit shutdown.
+        Attempt queued operations in FIFO order until the sentinel is dequeued.
         """
         try:
             thread_name = threading.current_thread().name
             chelper.get_ffi()[1].set_thread_name(thread_name.encode("utf-8"))
         except:
             pass
-        while self._write_thread_wait:
+        while True:
             func, args = self._write_queue.get()
             if func is self.sentinel:
                 return
@@ -587,7 +619,9 @@ class AFC_moonraker:
             self.logger.debug("Spoolman server is not defined")
             return None
 
-    def get_file_metadata(self, filename: str, callback: Callable[[Optional[dict[str, Any]]], None]) -> None:
+    def get_file_metadata(
+        self, filename: str, callback: Callable[[Optional[dict[str, Any]]], None]
+    ) -> None:
         """
         Queues a query for a print file's metadata to run on the background
         writer thread. Runs asynchronously because the only caller of this
@@ -598,7 +632,7 @@ class AFC_moonraker:
         :param callback: Called with the metadata dict (or None on failure)
                          once the query completes. Runs on the reactor thread.
         """
-        self._write_queue.put_nowait((self._get_file_metadata_sync, (filename, callback)))
+        self._enqueue(self._get_file_metadata_sync, (filename, callback))
 
     def _get_file_metadata_sync(self, filename: str, callback: Callable[[Optional[dict[str, Any]]], None]) -> None:
         """
@@ -656,7 +690,7 @@ class AFC_moonraker:
         :param key: The key indicating the field where the value should be inserted
         :param value: The value to insert into the database
         """
-        self._write_queue.put_nowait((self._update_afc_stats_sync, (key, value)))
+        self._enqueue(self._update_afc_stats_sync, (key, value))
 
     def _update_afc_stats_sync(self, key: str, value: Any) -> None:
         """
@@ -692,7 +726,7 @@ class AFC_moonraker:
                          occurred or ID does not exist) once the query completes.
                          Runs on the reactor thread.
         """
-        self._write_queue.put_nowait((self._get_spool_sync, (id, callback)))
+        self._enqueue(self._get_spool_sync, (id, callback))
 
     def _get_spool_sync(self, id: int, callback: Callable[[Optional[dict[str, Any]]], None]) -> None:
         """
@@ -766,7 +800,7 @@ class AFC_moonraker:
         :param callback: Called with the TD-1 devices dict (or None on failure)
                          once the query completes. Runs on the reactor thread.
         """
-        self._write_queue.put_nowait((self._get_td1_data_async_sync, (callback,)))
+        self._enqueue(self._get_td1_data_async_sync, (callback,))
 
     def _get_td1_data_async_sync(self, callback: Callable[[Optional[dict[str, Any]]], None]) -> None:
         """
@@ -808,9 +842,9 @@ class AFC_moonraker:
         are loaded and what their colors are. Runs on the background writer thread so the
         caller isn't blocked.
 
-        :params data: Data to send to endpoint
+        :param data: Data to send to endpoint
         """
-        self._write_queue.put_nowait((self._send_lane_data_sync, (data,)))
+        self._enqueue(self._send_lane_data_sync, (data,))
 
     def _send_lane_data_sync(self, data: Any) -> None:
         """
@@ -841,7 +875,7 @@ class AFC_moonraker:
         :param namespace: Namespace for moonrakers database
         :param key: Key to delete from namespace
         """
-        self._write_queue.put_nowait((self._remove_database_entry_sync, (namespace, key)))
+        self._enqueue(self._remove_database_entry_sync, (namespace, key))
 
     def _remove_database_entry_sync(self, namespace: str, key: str) -> None:
         """
@@ -858,7 +892,7 @@ class AFC_moonraker:
                 "key": key
             }
             req = Request( self.database_url, urlencode(payload).encode(), method="DELETE")
-            with urlopen(req):
+            with urlopen(req, timeout=self.REQUEST_TIMEOUT):
                 pass
             self._log_async(self.logger.debug, f"Removing {key} from {namespace}")
         except HTTPError as e:

@@ -28,6 +28,7 @@ from extras.AFC_lane import (
 )
 from extras.AFC_stepper import AFCExtruderStepper
 from tests.conftest import MockAFC, MockLogger
+from tests.test_AFC_moonraker_io import moonraker_io as moonraker_io
 
 
 # ── SpeedMode ─────────────────────────────────────────────────────────────────
@@ -4244,3 +4245,82 @@ class TestPrepCallback:
 
         lane_b.handle_prep_runout(20.0, False)
         lane_b.set_unloaded.assert_called_once()
+
+
+class TestAFCLaneHandleMoonrakerConnect:
+    @pytest.mark.parametrize(("unit_type", "fullname", "admitted"), [
+        ("BoxTurtle", "AFC_stepper lane1", True),
+        ("HTLF", "AFC_stepper lane1", False),
+        ("HTLF", "AFC_lane lane1", True),
+    ])
+    def test_repeated_prep_retains_count_and_repeats_other_setup(
+            self, moonraker_io, unit_type, fullname, admitted):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.fullname = fullname
+        lane.unit_obj = MagicMock(type=unit_type)
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.td1_when_loaded = True
+        io.client.get_afc_stats = io.startup_stats
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        with patch.object(lane.espooler, "handle_moonraker_connect",
+                          wraps=lane.espooler.handle_moonraker_connect) as connect:
+            lane.handle_moonraker_connect()
+            if admitted:
+                counter = lane.lane_load_count
+                counter.increase_count()
+                counter.increase_count()
+                counter.reset_count()
+                counter.increase_count()
+            lane.afc.td1_defined = False
+            lane.handle_moonraker_connect()
+        if admitted:
+            assert lane.lane_load_count is counter
+            assert counter.value == 1
+            assert connect.call_count == 2
+            assert lane.td1_when_loaded is False
+            assert io.startup_reads == 2
+            io.wait_idle()
+            assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        else:
+            assert lane.lane_load_count is None
+            assert connect.call_count == 0
+            assert lane.td1_when_loaded is True
+            assert io.startup_reads == 0
+            assert io.records == []
+        assert io.logger.messages == []
+
+    def test_failed_stat_initialization_retries_lane_and_espooler(self, moonraker_io):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.unit_obj = MagicMock(type="BoxTurtle")
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        attempts = []
+
+        def startup():
+            attempts.append("read")
+            if len(attempts) == 1:
+                raise ValueError("controlled startup read failure")
+            return None
+
+        io.client.get_afc_stats = startup
+        with pytest.raises(ValueError, match="controlled startup read failure"):
+            lane.handle_moonraker_connect()
+        assert lane.lane_load_count is None
+        lane.handle_moonraker_connect()
+        counter = lane.lane_load_count
+        counter.increase_count()
+        lane.handle_moonraker_connect()
+        assert lane.lane_load_count is counter
+        assert counter.value == 1
+        assert attempts == ["read", "read", "read"]
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        assert io.logger.messages == []

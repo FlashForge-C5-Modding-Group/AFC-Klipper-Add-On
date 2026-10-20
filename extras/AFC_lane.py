@@ -589,17 +589,18 @@ class AFCLane:
 
         self.endstops.update({name: {"endstop": endstop, "endstop_name": endstop_name}})
 
-    def handle_moonraker_connect(self):
+    def handle_moonraker_connect(self) -> None:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Initialize the lane counter once and refresh espooler and TD-1 setup.
         """
 
         if (self.unit_obj.type not in EXCLUDE_TYPES
-            or (self.unit_obj.type in EXCLUDE_TYPES and "AFC_lane" in self.fullname)):
-            values = self.afc.moonraker.get_afc_stats()
-            self.lane_load_count = AFCStats_var(self.name, "load_count", values, self.afc.moonraker)
+            or (self.unit_obj.type in EXCLUDE_TYPES
+                and "AFC_lane" in self.fullname)):
+            if self.lane_load_count is None:
+                values = self.afc.moonraker.get_afc_stats()
+                self.lane_load_count = AFCStats_var(
+                    self.name, "load_count", values, self.afc.moonraker)
             self.espooler.handle_moonraker_connect()
 
             # Update boolean and check to make sure a TD-1 device is detected
