@@ -20,6 +20,7 @@ from extras.AFC_extruder import AFCExtruderStats, AFCExtruder
 from extras.AFC import State
 from tests.conftest import MockGCodeCommand
 from tests.test_AFC_lane import _make_afc_lane, AFCLaneState
+from tests.test_AFC_moonraker_io import moonraker_io as moonraker_io
 # ── Helpers ─────────────────────────────────────────────────────────
 
 def _make_extruder_obj(name="extruder"):
@@ -77,6 +78,27 @@ def _make_stats(extruder_name="extruder", cut_threshold=200, cut_since_changed=0
 # ── AFCExtruderStats: initialization ──────────────────────────────────────────
 
 class TestAFCExtruderStatsInit:
+    def test_real_constructor_defers_loading_and_supports_first_counter_update(self, moonraker_io):
+        io = moonraker_io
+        obj = _make_extruder_obj()
+        obj.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCExtruderStats("extruder", obj, 350)
+        assert io.startup_reads == 0
+        assert io.records == []
+        stats.handle_moonraker_stats()
+        stats.cut_total.increase_count()
+        io.wait_idle()
+        assert stats.name == "extruder"
+        assert stats.cut_threshold_for_warning == 350
+        assert stats.cut_total.value == 1
+        assert io.startup_reads == 1
+        assert io.contents == {
+            ("afc_stats", "extruder.cut.last_blade_changed"): "N/A",
+            ("afc_stats", "extruder.cut.cut_total"): "1",
+        }
+        assert io.logger.messages == []
+
     def test_name_stored(self):
         stats = _make_stats("extruder")
         assert stats.name == "extruder"
@@ -2022,3 +2044,115 @@ class TestRestoreVirtualToolStart:
         ext.restore_virtual_tool_start(1)
         assert ext.tc_lane._load_state is True
         ext._apply_virtual_tool_start_state.assert_called_once_with(True)
+
+
+class TestAFCExtruderStatsHandleMoonrakerStats:
+    @pytest.mark.parametrize(("name", "count_key"), [
+        ("extruder", "extruder.change_count.total"),
+        ("extruder1", "extruder1.cut.total"),
+    ])
+    def test_repeated_prep_preserves_counters_and_resets(self, moonraker_io, name, count_key):
+        io = moonraker_io
+        obj = _make_extruder_obj(name)
+        obj.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCExtruderStats(name, obj, 200)
+        stats.handle_moonraker_stats()
+        cut = stats.cut_total
+        count = stats.tc_total
+        cut.increase_count()
+        cut.increase_count()
+        cut.reset_count()
+        count.increase_count()
+        stats.handle_moonraker_stats()
+        assert stats.cut_total is cut
+        assert stats.tc_total is count
+        assert cut.value == 0
+        assert count.value == 1
+        assert io.startup_reads == 1
+        io.wait_idle()
+        assert io.contents[("afc_stats", f"{name}.cut.cut_total")] == "0"
+        assert io.contents[("afc_stats", count_key)] == "1"
+        assert io.logger.messages == []
+
+    def test_partial_initialization_is_retryable(self, moonraker_io):
+        from extras.AFC_stats import AFCStats_var
+
+        io = moonraker_io
+        obj = _make_extruder_obj()
+        obj.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCExtruderStats("extruder", obj, 200)
+        attempts = []
+
+        def initialize(*args, **kwargs):
+            attempts.append(args[1])
+            if len(attempts) == 2:
+                raise ValueError("controlled partial initialization")
+            return AFCStats_var(*args, **kwargs)
+
+        with patch("extras.AFC_extruder.AFCStats_var", side_effect=initialize):
+            with pytest.raises(ValueError, match="controlled partial initialization"):
+                stats.handle_moonraker_stats()
+            stats.handle_moonraker_stats()
+            total = stats.cut_total
+            total.increase_count()
+            stats.handle_moonraker_stats()
+        assert io.startup_reads == 2
+        assert stats.cut_total is total
+        assert stats.cut_total.value == 1
+        assert stats.last_blade_changed.value == "N/A"
+        io.wait_idle()
+        assert io.contents == {
+            ("afc_stats", "extruder.cut.last_blade_changed"): "N/A",
+            ("afc_stats", "extruder.cut.cut_total"): "1",
+        }
+        assert io.logger.messages == []
+
+    def test_saved_blade_date_survives_first_and_repeated_connection_without_write(
+            self, moonraker_io):
+        io = moonraker_io
+        io.startup_values = {
+            "extruder": {
+                "cut": {
+                    "cut_total": 3,
+                    "cut_total_since_changed": 2,
+                    "last_blade_changed": "2026-10-01 12:30",
+                },
+                "change_count": {
+                    "total": 5,
+                    "tool_unload": 2,
+                    "tool_load": 3,
+                    "tool_selected": 4,
+                    "tool_unselected": 4,
+                },
+            },
+        }
+        io.contents[("afc_stats", "extruder.cut.last_blade_changed")] = "2026-10-01 12:30"
+        obj = _make_extruder_obj()
+        obj.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCExtruderStats("extruder", obj, 200)
+        stats.handle_moonraker_stats()
+        saved_date = stats.last_blade_changed
+        io.wait_idle()
+        assert saved_date.value == "2026-10-01 12:30"
+        assert io.records == []
+        stats.handle_moonraker_stats()
+        io.wait_idle()
+        assert stats.last_blade_changed is saved_date
+        assert stats.last_blade_changed.value == "2026-10-01 12:30"
+        assert io.startup_reads == 1
+        assert io.records == []
+        assert io.contents == {
+            ("afc_stats", "extruder.cut.last_blade_changed"): "2026-10-01 12:30",
+        }
+        stats.cut_total.increase_count()
+        io.wait_idle()
+        assert stats.cut_total.value == 4
+        assert io.records == [("POST", "afc_stats", "extruder.cut.cut_total", "4")]
+        assert io.contents == {
+            ("afc_stats", "extruder.cut.last_blade_changed"): "2026-10-01 12:30",
+            ("afc_stats", "extruder.cut.cut_total"): "4",
+        }
+        assert io.logger.messages == []

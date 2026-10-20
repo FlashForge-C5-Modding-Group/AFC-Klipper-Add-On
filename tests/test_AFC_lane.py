@@ -28,6 +28,7 @@ from extras.AFC_lane import (
 )
 from extras.AFC_stepper import AFCExtruderStepper
 from tests.conftest import MockAFC, MockLogger
+from tests.test_AFC_moonraker_io import moonraker_io as moonraker_io
 
 
 # ── SpeedMode ─────────────────────────────────────────────────────────────────
@@ -304,6 +305,12 @@ class TestSelectorCalDis:
         assert lane.selector_cal_dis == 1.5
 
 
+class TestAFCLaneSpoolRequestGenerationInit:
+    def test_constructor_has_no_pending_spool_assignment(self):
+        lane = _make_real_afc_lane()
+        assert lane._spool_request_generation == 0
+
+
 # ── _get_steppers: stepperless unit early return ─────────────────────────────
 # New branch: stepperless units (e.g. OpenAMS) have no drive stepper to set up,
 # so _get_steppers returns immediately after resolving the unit object.
@@ -571,7 +578,7 @@ class TestGetTd1DataUnitHook:
 class TestGetTd1DataLoad:
     def _make(self, td1_present=True, td1_device_id="SN1"):
         lane = _make_afc_lane()
-        lane.afc.td1_present = td1_present
+        lane.afc.check_td1_present.return_value = td1_present
         lane.td1_device_id = td1_device_id
         lane.afc.moonraker = MagicMock()
         return lane
@@ -1251,6 +1258,55 @@ class TestAFCLaneMaterial:
         """'PLA+' should match 'PLA' entry."""
         lane = _make_lane_with_afc()
         lane.material = "PLA+"
+        assert lane.filament_density == 1.24
+
+    @pytest.mark.parametrize("material, densities", [
+        ({"PLA": True}, ["PLA:1.24"]),
+        ("PLA", ["PLA:broken"]),
+    ])
+    def test_invalid_material_density_does_not_partially_change_material(
+        self, material, densities
+    ):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = densities
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        with pytest.raises(ValueError):
+            lane.material = material
+        assert lane.material == "PETG"
+        assert lane.filament_density == 1.27
+
+
+class TestAFCLaneGetMaterialDensity:
+    @pytest.mark.parametrize("value, expected", [
+        (None, 1.24), ("", 1.24), ("PETG", 1.27), ("NYLON", 1.31),
+    ])
+    def test_preflight_returns_density_without_assignments(self, value, expected):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.24", "PETG:1.27"]
+        lane._material = "OLD"
+        lane.filament_density = 1.31
+        assert lane._get_material_density(value) == expected
+        assert lane.material == "OLD"
+        assert lane.filament_density == 1.31
+
+    @pytest.mark.parametrize("value", [True, 7, {}, ["PLA"]])
+    def test_non_text_material_is_rejected_before_assignments(self, value):
+        lane = _make_real_afc_lane()
+        lane._material = None
+        lane.filament_density = 1.24
+        with pytest.raises(ValueError, match="^Filament material must be text or None$"):
+            lane._get_material_density(value)
+        assert lane.material is None
+        assert lane.filament_density == 1.24
+
+    def test_first_material_match_wins(self):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.25", "PLA+:1.29"]
+        lane._material = None
+        lane.filament_density = 1.24
+        assert lane._get_material_density("PLA+") == 1.25
+        assert lane.material is None
         assert lane.filament_density == 1.24
 
 
@@ -3945,6 +4001,14 @@ class TestPrepCallback:
         from an NFC scan). The on_done callback passed to _set_values must
         re-push using the settled spool_id, and must not fire eagerly."""
         lane = _make_lane_ready_to_load()
+        from tests.test_AFC_spool import _make_spool
+        spool = _make_spool()
+        spool.afc = lane.afc
+        spool._set_values = MagicMock()
+        spool.set_active_spool = MagicMock()
+        lane.afc.spool = spool
+        lane.afc.lanes = {lane.name: lane}
+        lane.afc.current = lane.name
         lane.hub = "direct_load"
         lane.afc.TOOL_LOAD.return_value = True
         lane.prep_callback(10, True)
@@ -4244,3 +4308,82 @@ class TestPrepCallback:
 
         lane_b.handle_prep_runout(20.0, False)
         lane_b.set_unloaded.assert_called_once()
+
+
+class TestAFCLaneHandleMoonrakerConnect:
+    @pytest.mark.parametrize(("unit_type", "fullname", "admitted"), [
+        ("BoxTurtle", "AFC_stepper lane1", True),
+        ("HTLF", "AFC_stepper lane1", False),
+        ("HTLF", "AFC_lane lane1", True),
+    ])
+    def test_repeated_prep_retains_count_and_repeats_other_setup(
+            self, moonraker_io, unit_type, fullname, admitted):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.fullname = fullname
+        lane.unit_obj = MagicMock(type=unit_type)
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.td1_when_loaded = True
+        io.client.get_afc_stats = io.startup_stats
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        with patch.object(lane.espooler, "handle_moonraker_connect",
+                          wraps=lane.espooler.handle_moonraker_connect) as connect:
+            lane.handle_moonraker_connect()
+            if admitted:
+                counter = lane.lane_load_count
+                counter.increase_count()
+                counter.increase_count()
+                counter.reset_count()
+                counter.increase_count()
+            lane.afc.td1_defined = False
+            lane.handle_moonraker_connect()
+        if admitted:
+            assert lane.lane_load_count is counter
+            assert counter.value == 1
+            assert connect.call_count == 2
+            assert lane.td1_when_loaded is False
+            assert io.startup_reads == 2
+            io.wait_idle()
+            assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        else:
+            assert lane.lane_load_count is None
+            assert connect.call_count == 0
+            assert lane.td1_when_loaded is True
+            assert io.startup_reads == 0
+            assert io.records == []
+        assert io.logger.messages == []
+
+    def test_failed_stat_initialization_retries_lane_and_espooler(self, moonraker_io):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.unit_obj = MagicMock(type="BoxTurtle")
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        attempts = []
+
+        def startup():
+            attempts.append("read")
+            if len(attempts) == 1:
+                raise ValueError("controlled startup read failure")
+            return None
+
+        io.client.get_afc_stats = startup
+        with pytest.raises(ValueError, match="controlled startup read failure"):
+            lane.handle_moonraker_connect()
+        assert lane.lane_load_count is None
+        lane.handle_moonraker_connect()
+        counter = lane.lane_load_count
+        counter.increase_count()
+        lane.handle_moonraker_connect()
+        assert lane.lane_load_count is counter
+        assert counter.value == 1
+        assert attempts == ["read", "read", "read"]
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        assert io.logger.messages == []

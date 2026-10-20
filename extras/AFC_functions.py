@@ -2272,7 +2272,7 @@ class afcFunction:
             return
 
         if td1 is not None:
-            if not self.afc.td1_present:
+            if not self.afc.check_td1_present():
                 self.afc.error.AFC_error("TD-1 is not present, will not be able to calibrate bowden length for TD-1", pause=False)
             else:
                 if td1 not in self.afc.lanes:
@@ -2347,7 +2347,7 @@ class afcFunction:
             # Calibration for TD-1 bowden length
             if (td1 is not None
                 and td1_lane_valid
-                and self.afc.td1_present):
+                and self.afc.check_td1_present()):
                 title = "TD-1 Calibration"
                 td1_lane = self.afc.lanes[td1]
                 if (td1_lane.is_direct_hub()

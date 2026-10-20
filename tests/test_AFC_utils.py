@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import configparser
 import json
-import threading
 from io import StringIO
 from unittest.mock import MagicMock, patch, call
 import pytest
@@ -438,9 +437,10 @@ class TestAFCMoonraker:
         # override this to inspect the raw callback instead.
         reactor.register_async_callback = lambda cb, waketime=None: cb(0.0)
         mr = AFC_moonraker(host, port, logger, reactor)
-        # The real background writer thread is already parked on the original
-        # queue at this point (blocked in queue.get()); swapping it out here
-        # keeps tests deterministic instead of racing the live thread.
+        # Stop the real worker before using a test-only queue for sync helpers.
+        mr._write_queue.put_nowait((mr.sentinel, ()))
+        mr._write_thread.join(timeout=5)
+        assert not mr._write_thread.is_alive()
         mr._write_queue = MagicMock()
         return mr
 
@@ -460,7 +460,7 @@ class TestAFCMoonraker:
     def test_get_results_connection_error_returns_none(self):
         mr = self._make_moonraker()
         with patch("extras.AFC_utils.urlopen", side_effect=Exception("connection refused")):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
 
     def test_get_results_status_above_300_returns_none(self):
@@ -482,7 +482,7 @@ class TestAFCMoonraker:
         # list, in order, not just membership, per the repository test contract.
         messages_before = len(mr.logger.messages)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
         assert mr.logger.messages[messages_before:] == [
             ("debug", mr.ERROR_STRING),
@@ -500,7 +500,7 @@ class TestAFCMoonraker:
         mock_resp.__exit__ = MagicMock(return_value=False)
         messages_before = len(mr.logger.messages)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp):
-            result = mr._get_results("http://localhost:7125/server/info", print_error=False)
+            result = mr._get_results_sync("http://localhost:7125/server/info", print_error=False)
         assert result is None
         assert mr.logger.messages[messages_before:] == [
             ("debug", mr.ERROR_STRING),
@@ -516,7 +516,7 @@ class TestAFCMoonraker:
         mock_resp.__exit__ = MagicMock(return_value=False)
         with patch("extras.AFC_utils.urlopen", return_value=mock_resp), \
              patch("extras.AFC_utils.json.load", return_value=payload):
-            result = mr._get_results("http://localhost:7125/server/info")
+            result = mr._get_results_sync("http://localhost:7125/server/info")
         assert result == {"state": "ready"}
 
     def test_check_and_return_helper(self):
@@ -525,16 +525,11 @@ class TestAFCMoonraker:
         from extras.AFC_utils import check_and_return
         assert check_and_return("x", {"x": 42}) == 42
 
-    def test_update_afc_stats_queues_sync_write(self):
-        mr = self._make_moonraker()
-        mr.update_afc_stats("some.key", 10)
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._update_afc_stats_sync, ("some.key", 10)))
 
     def test_update_afc_stats_sync_logs_on_failure(self):
         mr = self._make_moonraker()
         init_messages = list(mr.logger.messages)
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         mr._update_afc_stats_sync("some.key", 10)
         assert mr.logger.messages == init_messages + [
             ("error", "Error when trying to update some.key in moonraker, see AFC.log for more info"),
@@ -543,45 +538,31 @@ class TestAFCMoonraker:
     def test_update_afc_stats_sync_no_error_on_success(self):
         mr = self._make_moonraker()
         init_messages = list(mr.logger.messages)
-        mr._get_results = MagicMock(return_value={"value": "ok"})
+        mr._get_results_sync = MagicMock(return_value={"value": "ok"})
         mr._update_afc_stats_sync("some.key", 10)
         assert mr.logger.messages == init_messages
 
-    def test_get_spool_queues_sync_read(self):
-        mr = self._make_moonraker()
-        callback = MagicMock()
-        mr.get_spool(42, callback)
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._get_spool_sync, (42, callback)))
-        callback.assert_not_called()
 
     def test_get_spool_sync_not_found_logs_info(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_spool_sync(42, callback)
         callback.assert_called_once_with(None)
         infos = [m for lvl, m in mr.logger.messages if lvl == "info"]
         assert any("42" in m for m in infos)
 
-    def test_get_file_metadata_queues_sync_read(self):
-        mr = self._make_moonraker()
-        callback = MagicMock()
-        mr.get_file_metadata("test.gcode", callback)
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._get_file_metadata_sync, ("test.gcode", callback)))
-        callback.assert_not_called()
 
     def test_get_file_metadata_sync_returns_resp_when_found(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"filament_change_count": 3})
+        mr._get_results_sync = MagicMock(return_value={"filament_change_count": 3})
         callback = MagicMock()
         mr._get_file_metadata_sync("test.gcode", callback)
         callback.assert_called_once_with({"filament_change_count": 3})
 
     def test_get_file_metadata_sync_returns_none_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_file_metadata_sync("test.gcode", callback)
         callback.assert_called_once_with(None)
@@ -589,9 +570,9 @@ class TestAFCMoonraker:
     def test_get_file_metadata_sync_queries_correct_url(self):
         from urllib.parse import urljoin, quote
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         mr._get_file_metadata_sync("sub dir/test file.gcode", MagicMock())
-        queried_url = mr._get_results.call_args[0][0]
+        queried_url = mr._get_results_sync.call_args[0][0]
         expected_url = urljoin(
             mr.host, f"{mr.FILENAME_PATH}{quote('sub dir/test file.gcode')}")
         assert queried_url == expected_url
@@ -710,31 +691,24 @@ class TestAFCMoonraker:
 
     # ── get_td1_data_async ───────────────────────────────────────────────────
 
-    def test_get_td1_data_async_queues_sync_read(self):
-        mr = self._make_moonraker()
-        callback = MagicMock()
-        mr.get_td1_data_async(callback)
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._get_td1_data_async_sync, (callback,)))
-        callback.assert_not_called()
 
     def test_get_td1_data_async_sync_returns_devices_on_success(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"devices": {"SN123": {}}})
+        mr._get_results_sync = MagicMock(return_value={"devices": {"SN123": {}}})
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with({"SN123": {}})
 
     def test_get_td1_data_async_sync_returns_none_when_no_devices_key(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"other": "data"})
+        mr._get_results_sync = MagicMock(return_value={"other": "data"})
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with(None)
 
     def test_get_td1_data_async_sync_returns_none_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
+        mr._get_results_sync = MagicMock(return_value=None)
         callback = MagicMock()
         mr._get_td1_data_async_sync(callback)
         callback.assert_called_once_with(None)
@@ -755,34 +729,23 @@ class TestAFCMoonraker:
 
     # ── send_lane_data ────────────────────────────────────────────────────────
 
-    def test_send_lane_data_queues_sync_write(self):
-        mr = self._make_moonraker()
-        data = {"lane1": {"color": "red"}}
-        mr.send_lane_data(data)
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._send_lane_data_sync, (data,)))
 
     def test_send_lane_data_sync_logs_error_on_failure(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value=None)
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._get_results_sync = MagicMock(return_value=None)
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) == 1
 
     def test_send_lane_data_sync_success_no_error(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"value": "ok"})
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._get_results_sync = MagicMock(return_value={"value": "ok"})
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) == 0
 
     # ── remove_database_entry ─────────────────────────────────────────────────
 
-    def test_remove_database_entry_queues_sync_write(self):
-        mr = self._make_moonraker()
-        mr.remove_database_entry("lane_data", "lane1")
-        mr._write_queue.put_nowait.assert_called_once_with(
-            (mr._remove_database_entry_sync, ("lane_data", "lane1")))
 
     def test_remove_database_entry_sync_calls_urlopen(self):
         mr = self._make_moonraker()
@@ -837,7 +800,7 @@ class TestAFCMoonraker:
 
     def test_get_spool_sync_returns_resp_when_found(self):
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(return_value={"id": 42, "name": "PLA"})
+        mr._get_results_sync = MagicMock(return_value={"id": 42, "name": "PLA"})
         callback = MagicMock()
         mr._get_spool_sync(42, callback)
         callback.assert_called_once_with({"id": 42, "name": "PLA"})
@@ -938,10 +901,10 @@ class TestAFCMoonraker:
         """HTTPError propagated from _get_results."""
         from urllib.error import HTTPError
         mr = self._make_moonraker()
-        mr._get_results = MagicMock(
+        mr._get_results_sync = MagicMock(
             side_effect=HTTPError(None, 500, "Internal Server Error", {}, None)
         )
-        mr._send_lane_data_sync({"lane1": {"color": "red"}})
+        mr._send_lane_data_sync(b'{"lane1": {"color": "red"}}')
         errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
         assert len(errors) >= 1
 
@@ -958,148 +921,6 @@ class TestAFCMoonraker:
         assert len(errors) >= 1
 
 
-# ── AFC_moonraker background writer ─────────────────────────────────────────
-
-class TestAFCMoonrakerBackgroundWriter:
-    def _make_moonraker_with_real_reactor_hook(self):
-        """Build an AFC_moonraker but capture the register_async_callback
-        call instead of running it immediately, so tests can drive it by hand."""
-        from tests.conftest import MockLogger, MockReactor
-        logger = MockLogger()
-        reactor = MockReactor()
-        reactor.register_async_callback = MagicMock()
-        mr = AFC_moonraker("http://localhost", "7125", logger, reactor)
-        # The constructor already started a real worker parked on the real
-        # queue; stop and join it before swapping the queue for a MagicMock,
-        # otherwise it stays blocked on the orphaned real queue forever and
-        # leaks a daemon thread per test.
-        mr._write_queue.put_nowait((mr.sentinel, ()))
-        mr._write_thread.join(timeout=5)
-        mr._write_queue = MagicMock()
-        return mr
-
-    def test_init_starts_background_writer_thread(self):
-        from tests.conftest import MockLogger, MockReactor
-        mr = AFC_moonraker("http://localhost", "7125", MockLogger(), MockReactor())
-        assert mr._write_thread.is_alive()
-        assert mr._write_thread.daemon is True
-        assert mr._write_thread.name == "afc_moonraker"
-
-    def test_log_async_schedules_callback_on_reactor(self):
-        mr = self._make_moonraker_with_real_reactor_hook()
-        log_fn = MagicMock()
-        mr._log_async(log_fn, "hello", traceback="tb")
-        mr.reactor.register_async_callback.assert_called_once()
-        scheduled_cb = mr.reactor.register_async_callback.call_args[0][0]
-        log_fn.assert_not_called()
-        scheduled_cb(0.0)
-        log_fn.assert_called_once_with("hello", traceback="tb")
-
-    def test_write_worker_processes_queued_call_then_loops(self):
-        """Drives exactly one loop iteration: the second queue.get() raises
-        to break out of the otherwise-infinite loop deterministically."""
-        mr = self._make_moonraker_with_real_reactor_hook()
-        called = []
-        mr._write_queue.get.side_effect = [
-            (lambda a, b: called.append((a, b)), (1, 2)),
-            RuntimeError("stop test loop"),
-        ]
-
-        with pytest.raises(RuntimeError, match="stop test loop"):
-            mr._write_worker()
-
-        assert called == [(1, 2)]
-
-    def test_write_worker_survives_exception_and_logs_it(self):
-        """A queued call that raises must not kill the worker loop -- it
-        should be caught, logged, and the loop must continue to the next item."""
-        mr = self._make_moonraker_with_real_reactor_hook()
-
-        def boom():
-            raise ValueError("kaboom")
-
-        mr._write_queue.get.side_effect = [
-            (boom, ()),
-            RuntimeError("stop test loop"),
-        ]
-
-        with pytest.raises(RuntimeError, match="stop test loop"):
-            mr._write_worker()
-
-        scheduled_calls = mr.reactor.register_async_callback.call_args_list
-        assert len(scheduled_calls) == 2
-        scheduled_calls[0][0][0](0.0)
-        scheduled_calls[1][0][0](0.0)
-        errors = [m for lvl, m in mr.logger.messages if lvl == "error"]
-        debug_msgs = [m for lvl, m in mr.logger.messages if lvl == "debug"]
-        assert errors == ["Unexpected error in moonraker background writer"]
-        assert any("kaboom" in m for m in debug_msgs)
-
-    def test_write_worker_sets_os_thread_name(self):
-        mr = self._make_moonraker_with_real_reactor_hook()
-        mr._write_queue.get.side_effect = [RuntimeError("stop test loop")]
-        fake_ffi_lib = MagicMock()
-
-        with patch("chelper.get_ffi", return_value=(MagicMock(), fake_ffi_lib)):
-            with pytest.raises(RuntimeError, match="stop test loop"):
-                mr._write_worker()
-
-        fake_ffi_lib.set_thread_name.assert_called_once_with(
-            threading.current_thread().name.encode("utf-8"))
-
-    def test_write_worker_survives_exception_setting_thread_name(self):
-        """A failure naming the OS thread (e.g. chelper unavailable) must not
-        stop the worker from processing queued calls."""
-        mr = self._make_moonraker_with_real_reactor_hook()
-        called = []
-        mr._write_queue.get.side_effect = [
-            (lambda a, b: called.append((a, b)), (1, 2)),
-            RuntimeError("stop test loop"),
-        ]
-
-        with patch("chelper.get_ffi", side_effect=Exception("boom")):
-            with pytest.raises(RuntimeError, match="stop test loop"):
-                mr._write_worker()
-
-        assert called == [(1, 2)]
-
-    def test_join_thread_clears_write_thread_wait_flag(self):
-        mr = self._make_moonraker_with_real_reactor_hook()
-        mr._write_thread_wait = True
-        mr.join_thread()
-        assert mr._write_thread_wait is False
-
-    def test_join_thread_puts_sentinel_on_write_queue(self):
-        mr = self._make_moonraker_with_real_reactor_hook()
-        mr.join_thread()
-        mr._write_queue.put_nowait.assert_called_once_with((mr.sentinel, ""))
-
-    def test_write_worker_returns_on_sentinel_without_calling_it(self):
-        """join_thread queues (sentinel, ""); the worker must return instead
-        of trying to call the sentinel class as a function."""
-        mr = self._make_moonraker_with_real_reactor_hook()
-        mr._write_queue.get.side_effect = [(mr.sentinel, "")]
-
-        result = mr._write_worker()
-
-        assert result is None
-
-    def test_write_worker_stops_looping_once_join_thread_clears_wait_flag(self):
-        """Simulates a real klippy:disconnect: join_thread flips the wait
-        flag and queues the sentinel, and the worker must exit its loop."""
-        mr = self._make_moonraker_with_real_reactor_hook()
-        called = []
-
-        def stop_after_call(a, b):
-            called.append((a, b))
-            mr.join_thread()
-
-        mr._write_queue.get.side_effect = [(stop_after_call, (1, 2))]
-
-        mr._write_worker()
-
-        assert called == [(1, 2)]
-        assert mr._write_thread_wait is False
 
 
 # ── AFC_PrintFileMetaData ───────────────────────────────────────────────────
@@ -1235,6 +1056,56 @@ class TestAFCPrintFileMetaDataFilename:
         meta.query_filename("second.gcode")
         assert meta.tool_change_count == 7
         assert meta.tool_temperatures == [220]
+
+    @pytest.mark.parametrize("reset", [False, True])
+    def test_same_filename_restart_discards_old_response_and_continuation(self, reset):
+        meta, moonraker = _make_print_file_metadata()
+        pending = []
+        finished = []
+        moonraker.get_file_metadata.side_effect = (
+            lambda filename, callback: pending.append(callback))
+        meta.query_filename("same.gcode", lambda: finished.append("old"))
+        if reset:
+            meta.reset()
+        meta.query_filename("same.gcode", lambda: finished.append("new"))
+        pending[0]({"filament_change_count": 99, "filament_temps": [299]})
+        assert meta._metadata == {}
+        assert finished == []
+        pending[1]({"filament_change_count": 3, "filament_temps": [210]})
+        assert meta.tool_change_count == 3
+        assert meta.tool_temperatures == [210]
+        assert finished == ["new"]
+
+    def test_starting_query_clears_previous_cached_values(self):
+        meta, moonraker = _make_print_file_metadata()
+        _stub_get_file_metadata(moonraker, {"filament_change_count": 9})
+        meta.query_filename("old.gcode")
+        moonraker.get_file_metadata.side_effect = None
+        meta.query_filename("next.gcode")
+        assert meta._metadata == {}
+
+
+class TestAFCPrintFileMetaDataApplyMetadata:
+    @pytest.mark.parametrize("generation, filename", [
+        (0, "active.gcode"), (1, "obsolete.gcode"),
+    ])
+    def test_rejected_owner_does_not_cache_or_continue(self, generation, filename):
+        meta, _ = _make_print_file_metadata()
+        meta.query_filename("active.gcode")
+        finished = []
+        meta._apply_metadata(generation, filename, {"filament_change_count": 99},
+                             lambda: finished.append("obsolete"))
+        assert meta._metadata == {}
+        assert finished == []
+
+    @pytest.mark.parametrize("response", [None, {}, {"filament_change_count": 3}])
+    def test_active_response_settles_current_continuation(self, response):
+        meta, _ = _make_print_file_metadata()
+        meta.query_filename("active.gcode")
+        finished = []
+        meta._apply_metadata(1, "active.gcode", response, lambda: finished.append("current"))
+        assert meta._metadata == (response or {})
+        assert finished == ["current"]
 
 
 class TestAFCPrintFileMetaDataToolChangeCount:
