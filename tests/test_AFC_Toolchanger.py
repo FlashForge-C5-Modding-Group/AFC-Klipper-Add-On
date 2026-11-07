@@ -50,6 +50,7 @@ def _make_lane_for_system_test(name="lane1", tcmd="T0"):
     lane.map_to_string = MagicMock(return_value=tcmd)
     lane.prep_state = False
     lane.load_state = False
+    lane.extruder_obj.creator5_tool_index = None
     lane.extruder_obj.lane_loaded = None
     lane.extruder_obj.prep_on_shuttle_check.return_value = ""
     return lane

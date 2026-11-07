@@ -29,12 +29,13 @@ import math
 import sys
 import importlib.util
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import pytest
 
 from extras.AFC_assist import (
     AFCassistMotor, EspoolerDir, AFCEspoolerStats, Espooler, RESEND_HOST_TIME,
 )
+from tests.test_AFC_moonraker_io import moonraker_io as moonraker_io
 
 PIN_MIN_TIME = 0.100  # Must match source constant
 
@@ -2012,3 +2013,97 @@ class TestModuleImportGuard:
             _exec_afc_assist_with_blocked_dependency("extras.AFC_stats")
         assert str(exc_info.value).startswith(
             "Error trying to import AFC_stats, please rerun install-afc.sh script")
+
+
+class TestAFCEspoolerStatsInit:
+    def test_constructor_defers_loading_then_tracks_runtime_for_its_owner(self, moonraker_io):
+        io = moonraker_io
+        io.startup_values = {"lane1": {"n20_runtime_fwd": 5, "n20_runtime_rwd": 7}}
+        espooler = _make_real_espooler()
+        espooler.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCEspoolerStats("lane1", espooler)
+        assert io.startup_reads == 0
+        assert io.records == []
+        stats.handle_moonraker_stats()
+        stats.direction = EspoolerDir.FWD
+        stats.start_time = 10.0
+        stats.end_time = 12.0
+        stats.update_database()
+        io.wait_idle()
+        assert stats.espooler_obj is espooler
+        assert stats._n20_runtime_fwd.value == 7.0
+        assert stats._n20_runtime_rwd.value == 7
+        assert stats._fwd_updated is False
+        assert stats._rwd_updated is False
+        assert io.startup_reads == 1
+        assert io.records == [("POST", "afc_stats", "lane1.n20_runtime_fwd", "7.0")]
+        assert io.contents == {("afc_stats", "lane1.n20_runtime_fwd"): "7.0"}
+        assert io.logger.messages == []
+
+
+class TestAFCEspoolerStatsHandleMoonrakerStats:
+    def test_repeated_prep_retains_unsent_runtime_and_dirty_flags(self, moonraker_io):
+        io = moonraker_io
+        espooler = _make_real_espooler()
+        espooler.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCEspoolerStats("lane1", espooler)
+        stats.handle_moonraker_stats()
+        forward = stats._n20_runtime_fwd
+        reverse = stats._n20_runtime_rwd
+        stats.direction = EspoolerDir.FWD
+        stats.start_time = 10.0
+        stats.end_time = 12.5
+        stats.direction = EspoolerDir.RWD
+        stats.start_time = 20.0
+        stats.end_time = 24.0
+        assert io.records == []
+        stats.handle_moonraker_stats()
+        assert stats._n20_runtime_fwd is forward
+        assert stats._n20_runtime_rwd is reverse
+        assert forward.value == 2.5
+        assert reverse.value == 4.0
+        assert stats._fwd_updated is True
+        assert stats._rwd_updated is True
+        assert io.startup_reads == 1
+        stats.update_database()
+        io.wait_idle()
+        assert io.contents == {
+            ("afc_stats", "lane1.n20_runtime_fwd"): "2.5",
+            ("afc_stats", "lane1.n20_runtime_rwd"): "4.0",
+        }
+        assert stats._fwd_updated is False
+        assert stats._rwd_updated is False
+        assert io.logger.messages == []
+
+    def test_partial_initialization_is_retryable(self, moonraker_io):
+        from extras.AFC_stats import AFCStats_var
+
+        io = moonraker_io
+        espooler = _make_real_espooler()
+        espooler.afc.moonraker = io.client
+        io.client.get_afc_stats = io.startup_stats
+        stats = AFCEspoolerStats("lane1", espooler)
+        attempts = []
+
+        def initialize(*args):
+            attempts.append(args[1])
+            if len(attempts) == 2:
+                raise ValueError("controlled reverse initialization failure")
+            return AFCStats_var(*args)
+
+        with patch("extras.AFC_assist.AFCStats_var", side_effect=initialize):
+            with pytest.raises(ValueError, match="controlled reverse initialization failure"):
+                stats.handle_moonraker_stats()
+            stats.handle_moonraker_stats()
+            forward = stats._n20_runtime_fwd
+            forward.increase_count()
+            stats.handle_moonraker_stats()
+        assert stats._n20_runtime_fwd is forward
+        assert forward.value == 1
+        assert stats._n20_runtime_rwd.value == 0
+        assert io.startup_reads == 2
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "lane1.n20_runtime_fwd"): "1"}
+        assert io.logger.messages == []

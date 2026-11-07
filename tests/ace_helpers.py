@@ -1240,6 +1240,8 @@ class AceAFC:
         self.active_led_effects: List[str] = []
         self.td1_present = False
         self.td1_defined = False
+        self.track_filament_weight = True
+        self.enable_td1_detection = True
         self.default_material_type: Optional[str] = None
         self.common_density_values: List[str] = ["PLA:1.24", "PETG:1.23", "ABS:1.04",
                                                  "ASA:1.07"]
@@ -1349,6 +1351,7 @@ class AceToolhead:
         self.active_extruder = active_extruder
         self.extruders: Dict[str, _AceToolheadExtruder] = {}
         self.flush_step_generation = Recorder()
+        self.wait_moves = Recorder()
         self.set_extruder = Hook(self._set_extruder)
 
     def extruder(self, name: str) -> _AceToolheadExtruder:
@@ -1413,6 +1416,8 @@ class AceExtruder:
         self.led_index: Optional[str] = None
         self.check_lanes = Recorder()
         self.set_status_led = Recorder()
+        self.creator5_tool_index: Optional[int] = None
+        self.creator5_mount_error: Optional[str] = None
         self.reactor = reactor
 
     def clear_stale_sensor_state(self, lane: Any) -> None:

@@ -61,7 +61,14 @@ class AfcToolchanger(afcUnit):
         # Now that a T command is assigned, send lane data to moonraker
         cur_lane.send_lane_data()
         msg = ""
-        if( cur_lane.prep_state
+        if cur_lane.extruder_obj.creator5_tool_index is not None:
+            # Creator 5 heads report filament and mount state separately
+            if cur_lane.extruder_obj.tool_start_state:
+                msg = "<span class=success--text>FILAMENT PRESENT</span>"
+            else:
+                msg = "<span class=primary--text>FILAMENT ABSENT</span>"
+            msg += cur_lane.extruder_obj.prep_on_shuttle_check(cur_lane)
+        elif( cur_lane.prep_state
             and cur_lane.load_state
             and cur_lane.extruder_obj.lane_loaded == cur_lane.name):
             msg = "<span class=success--text>LOADED</span>"
@@ -222,9 +229,11 @@ class AfcToolchanger(afcUnit):
         lane.extruder_obj.next_pickup = True
         self._increase_unselect()
         self.afc.function.log_toolhead_pos("Before toolswap: ")
-        # Save the current position before switching tools and subtract offsets
-        for i in range(0, 3):
-            self.afc.last_gcode_position[i] -= self.afc.gcode_move.base_position[i]
+        # Keep the saved position in its original frame until selection succeeds.
+        saved_gcode_xyz = [
+            self.afc.last_gcode_position[i] - self.afc.gcode_move.base_position[i]
+            for i in range(3)
+        ]
         # Perform a tool swap by selecting the appropriate extruder based on the lane's extruder object.
         self.afc.afcDeltaTime.log_with_time("Performing tool swap")
         name = lane.extruder_obj.th_extruder_name
@@ -242,11 +251,12 @@ class AfcToolchanger(afcUnit):
 
         # Switching toolhead extruders, this is mainly for setups with multiple extruders
         lane.activate_toolhead_extruder()
-        # Need to call again since KTC activate callback happens before switching to new extruder
-        # TODO: Take double call out once transitioned away from KTC
-        self.afc.function._handle_activate_extruder(0)
-
-        self.afc.toolhead.wait_moves()
+        if lane.extruder_obj.creator5_tool_index is None:
+            # Need to call again since KTC activate callback happens before switching to new
+            # extruder. Creator 5 already activates after verifying its mount sensors.
+            # TODO: Take double call out once transitioned away from KTC
+            self.afc.function._handle_activate_extruder(0)
+            self.afc.toolhead.wait_moves()
         self.afc.afcDeltaTime.log_with_time("Tool swap done", debug=False)
         if self.afc.afc_stats.average_tool_swap_time:
             self.afc.afc_stats.average_tool_swap_time.average_time(self.afc.afcDeltaTime.delta_time)
@@ -256,10 +266,18 @@ class AfcToolchanger(afcUnit):
         self.afc.homing_position = list(self.afc.gcode_move.homing_position)
         # Update the last_gcode_position to reflect the new base position after the tool swap.
         for i in range(0, 3):
-            self.afc.last_gcode_position[i] += self.afc.gcode_move.base_position[i]
+            self.afc.last_gcode_position[i] = (
+                saved_gcode_xyz[i] + self.afc.gcode_move.base_position[i])
 
         self.afc.function.log_toolhead_pos("After toolswap: ")
         lane.extruder_obj.estats.tool_selected.increase_count()
+        # Creator 5 tool changes bypass CHANGE_TOOL's counter, so advance the print's
+        # current/total toolchange display here instead
+        if (lane.extruder_obj.creator5_tool_index is not None
+            and not self.afc.error_state
+            and self.afc.number_of_toolchanges != 0
+            and self.afc.current_toolchange != self.afc.number_of_toolchanges):
+            self.afc.current_toolchange += 1
 
     cmd_AFC_SET_TOOLHEAD_LED_help = "Turns on leds for toolhead specified by mapping, does not affect status led if status_led_idx variable is provided"
     cmd_AFC_SET_TOOLHEAD_LED_options = {

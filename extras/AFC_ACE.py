@@ -230,6 +230,13 @@ class afcACE(afcUnit):
         # feeds the whole way at feed_speed.
         self.load_approach_length = config.getfloat("load_approach_length", 30.0, minval=0.0)
         self.load_approach_speed = config.getfloat("load_approach_speed", 50.0, minval=1.0)
+        # Toolheads whose sensor sits well before the extruder gears: after the sensor
+        # triggers, the ACE pushes this far on until the gears stop it. 0 disables the push.
+        self.sensor_to_gears = config.getfloat("sensor_to_gears", 0.0, minval=0.0)
+        self.sensor_to_gears_speed = config.getfloat("sensor_to_gears_speed", 25.0, minval=1.0)
+        # The last this many mm of that push run with the extruder turning too, at the
+        # extruder's tool_load_speed, so the gears catch the tip wherever it arrives.
+        self.sensor_to_gears_catch = config.getfloat("sensor_to_gears_catch", 0.0, minval=0.0)
         # Extra mm (beyond dist_hub) to retract when ejecting a hub-staged lane,
         # so the filament clears the hub and pulls fully back into the unit.
         self.eject_buffer = config.getfloat("eject_buffer", 475.0, minval=0.0)
@@ -2309,6 +2316,10 @@ class afcACE(afcUnit):
         cur_lane.loaded_to_hub = True
         self._set_hub_state(cur_lane, True)
 
+        if (self.sensor_to_gears > 0
+            and not self._push_to_gears(cur_lane, cur_extruder, slot)):
+            return False
+
         if self._use_feed_assist(cur_lane):
             self._start_feed_assist(slot, explicit=True)
 
@@ -2321,6 +2332,51 @@ class afcACE(afcUnit):
             self._log_delta("ACE load: tool_stn to nozzle")
 
         self._log_delta("ACE load transport complete")
+        return True
+
+    def _push_to_gears(self, cur_lane: AFCLane, cur_extruder: Any, slot: int) -> bool:
+        """
+        Feed sensor_to_gears past the toolhead sensor: fast up to the catch window, then the
+        window in step with the extruder so the gears take the tip as it arrives. A feed error
+        in the fast part (the unit's encoder sees the filament stop) means the tip is at the
+        gears already, so the catch window is skipped. Any other fast feed, or a catch feed,
+        that does not finish fails the lane.
+
+        :param cur_lane: Lane being loaded
+        :param cur_extruder: Extruder the lane loads into
+        :param slot: 0-based ACE slot index
+        :return bool: True once the push is done, False on a serial error or an unfinished
+                      feed (handled as a lane failure)
+        """
+        catch = min(self.sensor_to_gears_catch, self.sensor_to_gears)
+        fast = self.sensor_to_gears - catch
+        catch_speed = cur_extruder.tool_load_speed
+        self.logger.info(f"ACE load: pushing {cur_lane.name} {fast:.0f}mm on towards the "
+                         f"gears, then {catch:.0f}mm with the extruder")
+        try:
+            if fast >= 0.5:
+                self._wait_for_ace_ready()
+                self._ace.feed_filament(slot, fast, self.sensor_to_gears_speed)
+                fed = self._wait_for_feed_complete(slot, fast, self.sensor_to_gears_speed)
+                if self._last_move_error == "feed_error":
+                    self.logger.info(f"ACE load: {cur_lane.name} stopped at the gears")
+                    catch = 0
+                elif not fed:
+                    raise RuntimeError(f"the {fast:.0f}mm feed did not finish")
+            if catch >= 0.5:
+                cur_lane.activate_toolhead_extruder()
+                self._wait_for_ace_ready()
+                self._ace.feed_filament(slot, catch, catch_speed)
+                self.afc.move_e_pos(catch, catch_speed, "gear catch")
+                fed = self._wait_for_feed_complete(slot, catch, catch_speed)
+                self.afc.toolhead.wait_moves()
+                if not fed:
+                    raise RuntimeError(f"the {catch:.0f}mm gear catch feed did not finish")
+        except Exception as e:
+            self.afc.error.handle_lane_failure(cur_lane, f"ACE push to gears failed: {e}",
+                                               pause=self.afc.function.in_print())
+            return False
+        self._log_delta("ACE load: push to gears")
         return True
 
     def lane_unloading(self, lane: AFCLane) -> None:

@@ -551,6 +551,8 @@ class MockAFC:
         self.ignore_spoolman_material_temps = False
         self.auto_spool_switch = False
         self.auto_spool_switch_threshold = 25.0
+        self.track_filament_weight = True
+        self.enable_td1_detection = True
         self.default_material_type = "PLA"
         self.bypass = MagicMock()
         self.save_vars = MagicMock()
@@ -597,6 +599,9 @@ class MockAFC:
 
         self.snapmaker_printer = False
         self.enable_multiple_mapping = False
+
+    def check_td1_present(self):
+        return self.td1_present
 
 
 class MockPrinter:

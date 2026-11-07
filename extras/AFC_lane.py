@@ -99,6 +99,11 @@ class AFCLane:
     UPDATE_WEIGHT_DELAY = 10.0
     PREP_GUARD_WINDOW = 2.0  # seconds
     def __init__(self, config: ConfigWrapper) -> None:
+        """
+        Initialize a lane and its filament assignment ownership state.
+
+        :param config: Lane configuration section
+        """
         self._config            = config
         self.printer            = config.get_printer()
         self.afc: afc           = self.printer.load_object(config, 'AFC')
@@ -109,7 +114,10 @@ class AFCLane:
         self.logger             = self.afc.logger
         self.printer.register_event_handler("klippy:ready", self._handle_ready)
         self.printer.register_event_handler("afc:moonraker_connect", self.handle_moonraker_connect)
-        self.cb_update_weight   = self.reactor.register_timer( self.update_weight_callback )
+        # No weight timer when weight tracking is disabled in [AFC]
+        self.cb_update_weight = None
+        if self.afc.track_filament_weight:
+            self.cb_update_weight = self.reactor.register_timer( self.update_weight_callback )
 
         self.unit_obj: afcUnit  = None
         self.hub_obj: Optional[afc_hub|None] = None
@@ -126,13 +134,14 @@ class AFCLane:
         self.tool_loaded        = False
         self.loaded_to_hub      = False
         self.spool_id: Optional[Union[int, str]] = None
+        self._spool_request_generation = 0
         self.color: str         = ""
         self.multi_color: list  = []
         self.spool_vendor: str  = ""
         self.filament_name: str = ""
         self.weight: float      = 0.
         self.auto_switch_triggered: bool = False
-        self._material: str     = None
+        self._material: Optional[str] = None
         self.extruder_temp: Optional[int] = None
         self.bed_temp: Optional[int] = None
         self.td1_data           = {}
@@ -433,30 +442,43 @@ class AFCLane:
         return self._lookup_endstop(AFCHomingPoints.TOOL)
 
     @property
-    def material(self):
+    def material(self) -> Optional[str]:
         """
-        Returns lanes filament material type
+        Return the lane's current filament material.
 
-        :return str: Current filament material type for the lane
+        :return Optional[str]: Current material, or None when unset
         """
         return self._material
 
     @material.setter
-    def material(self, value):
+    def material(self, value: Optional[str]) -> None:
         """
-        Sets filament material type and sets filament density based off material type.
-        To use custom density, set density after setting material
-        """
-        self._material = value
-        if not value:
-            self.filament_density = 1.24 # Setting to a default value
-            return
+        Set material and its configured density only after validating both.
 
+        :param value: Material name, or None to clear it
+        """
+        density = self._get_material_density(value)
+        self._material = value
+        self.filament_density = density
+
+    def _get_material_density(self, value: Optional[str]) -> Optional[float]:
+        """
+        Resolve material density without changing the lane's filament fields.
+
+        :param value: Material name, or None to use the default density
+        :return Optional[float]: First matching density, or the current density
+        """
+        if (value is not None
+            and not isinstance(value, str)):
+            error_message = "Filament material must be text or None"
+            raise ValueError(error_message)
+        if not value:
+            return 1.24
         for density in self.afc.common_density_values:
-            v = density.split(":")
-            if v[0] in value:
-                self.filament_density = float(v[1])
-                break
+            parts = density.split(":")
+            if parts[0] in value:
+                return float(parts[1])
+        return self.filament_density
 
     @property
     def lane_index(self) -> str:
@@ -649,17 +671,18 @@ class AFCLane:
         endstop.add_stepper(homing_stepper.extruder_stepper.stepper)
         homing_stepper._endstops["tool_start"] = (endstop, endstop_name)
 
-    def handle_moonraker_connect(self):
+    def handle_moonraker_connect(self) -> None:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Initialize the lane counter once and refresh espooler and TD-1 setup.
         """
 
         if (self.unit_obj.type not in EXCLUDE_TYPES
-            or (self.unit_obj.type in EXCLUDE_TYPES and "AFC_lane" in self.fullname)):
-            values = self.afc.moonraker.get_afc_stats()
-            self.lane_load_count = AFCStats_var(self.name, "load_count", values, self.afc.moonraker)
+            or (self.unit_obj.type in EXCLUDE_TYPES
+                and "AFC_lane" in self.fullname)):
+            if self.lane_load_count is None:
+                values = self.afc.moonraker.get_afc_stats()
+                self.lane_load_count = AFCStats_var(
+                    self.name, "load_count", values, self.afc.moonraker)
             self.espooler.handle_moonraker_connect()
 
             # Update boolean and check to make sure a TD-1 device is detected
@@ -1097,6 +1120,10 @@ class AFCLane:
             - Swaps mapping between current lane and runout lane so correct lane is loaded with T(n) macro
             - Once changeover is successful print is automatically resumed
         """
+        if self.extruder_obj.creator5_tool_index is not None:
+            self._perform_creator5_infinite_runout()
+            return
+
         self.status = AFCLaneState.NONE
         self.logger.info("Infinite Spool triggered for {}".format(self.name))
         empty_lane = self.afc.lanes.get(self.afc.current)
@@ -1149,6 +1176,109 @@ class AFCLane:
             self.afc.error.pause_resume.send_resume_command()
             # Set LED to not ready
             self.unit_obj.lane_not_ready(self)
+
+    def _creator5_runout(self) -> None:
+        """
+        Creator 5 tool runout: pause, then switch to the runout lane or ask the user.
+
+        Runs from the filament sensor's reactor callback like Klipper's own runout handling:
+        stop the print after its current line, save that position for the switch to return
+        to, then run `C5_FILAMENT_RUNOUT`, which retracts the empty filament and either
+        switches to `TO` straight away or shows a prompt.
+        """
+        tool = self.extruder_obj.creator5_tool_index
+        to = None
+        if self.runout_lane is not None:
+            replacement = self.afc.lanes.get(self.runout_lane)
+            index = None
+            if (replacement is not None
+                and replacement is not self):
+                index = replacement.extruder_obj.creator5_tool_index
+            if index is None:
+                self.logger.error(f"Runout lane {self.runout_lane} for {self.name} is not "
+                                  "another Creator 5 tool")
+            elif not replacement.extruder_obj.tool_start_state:
+                self.logger.error(f"Runout lane {replacement.name} has no filament; "
+                                  "asking instead")
+            else:
+                to = index
+        self.afc.error.pause_resume.send_pause_command()
+        # Save the position the switch returns to, never a stale one
+        self.afc.position_saved = False
+        self.afc.save_pos()
+        self.status = AFCLaneState.NONE
+        self.unit_obj.lane_not_ready(self)
+        self.set_tool_unloaded()
+        self.set_unloaded()
+        self.afc.save_vars()
+        script = f"PAUSE\nC5_FILAMENT_RUNOUT TOOL={tool}"
+        if to is None:
+            self.logger.info(f"T{tool} ran out of filament")
+        else:
+            self.logger.info(f"Infinite Spool: T{tool} ran out, switching to T{to}")
+            script += f" TO={to}"
+        try:
+            self.gcode.run_script(script)
+        except Exception as exc:
+            self.afc.error.AFC_error(f"Creator 5 runout handling failed: {exc}")
+
+    def _perform_creator5_infinite_runout(self, replacement: Optional[AFCLane] = None,
+                                          target_temp: Optional[float] = None) -> None:
+        """
+        Switch complete Creator 5 heads on runout, without AFC filament feed moves.
+
+        :param replacement: Lane to switch to, defaults to this lane's runout lane
+        :param target_temp: Hotend target for the replacement, defaults to this hotend's target
+        """
+        if replacement is None:
+            replacement = self.afc.lanes.get(self.runout_lane)
+        if (replacement is None
+            or replacement is self
+            or replacement.extruder_obj.creator5_tool_index is None):
+            self.afc.error.AFC_error(f"Invalid Creator 5 infinite-spool replacement for "
+                                     f"{self.name}: {self.runout_lane}")
+            return
+        # A mapped tool is not necessarily loaded. Trust the replacement's
+        # physical filament switch before moving a head or resuming a print.
+        if not replacement.extruder_obj.tool_start_state:
+            self.afc.error.AFC_error(f"Infinite-spool replacement {replacement.name} has no "
+                                     "filament; print paused")
+            return
+
+        self.afc.save_pos()
+        self.afc.error.pause_resume.send_pause_command()
+        try:
+            source_heater = self.extruder_obj.toolhead_extruder.get_heater()
+            if target_temp is None:
+                target_temp = source_heater.target_temp
+            if target_temp <= source_heater.min_extrude_temp:
+                error_message = "source hotend has no printable target temperature"
+                raise RuntimeError(error_message)
+            target_heater = replacement.extruder_obj.toolhead_extruder.get_heater()
+            self.printer.lookup_object('heaters').set_temperature(target_heater, target_temp,
+                                                                  wait=True)
+            self.afc.CHANGE_TOOL(replacement, restore_pos=False)
+            if (self.afc.error_state
+                or not replacement.extruder_obj.on_shuttle()):
+                error_message = "replacement tool did not attach"
+                raise RuntimeError(error_message)
+            if not replacement.extruder_obj.tool_start_state:
+                error_message = "replacement tool has no filament"
+                raise RuntimeError(error_message)
+            self.gcode.run_script_from_command(
+                f'AFC_SWAP_MAPPING FROM={self.name} TO={replacement.name}')
+            self.set_tool_unloaded()
+            self.set_unloaded()
+            replacement.set_loaded()
+            replacement.set_tool_loaded(normal_toolchange=True)
+            self.afc.save_vars()
+            self.afc.restore_pos(move_z_first=False, keep_offsets=True)
+        except Exception as exc:
+            self.afc.error.AFC_error(f"Creator 5 infinite-spool change failed; print remains "
+                                     f"paused: {exc}")
+            return
+        self.logger.info(f"Infinite Spool switched {self.name} to {replacement.name}")
+        self.afc.error.pause_resume.send_resume_command()
 
     def _handle_auto_spool_switch(self):
         """
@@ -1390,13 +1520,12 @@ class AFCLane:
                                 if not self.afc.TOOL_LOAD(self):
                                     self.afc.afc_stats.increase_load_error_count(self.afc)
                                 # TOOL_LOAD already pushed the active spool to Spoolman using
-                                # whatever spool_id was set before this point. _set_values can
-                                # still be waiting on an async Spoolman fetch (from a next_spool_id
-                                # set by e.g. an NFC scan) that updates spool_id afterward, so
-                                # re-push once that settles rather than leaving Spoolman pointed
-                                # at the stale value TOOL_LOAD saw.
+                                # the spool_id set before this point. _set_values can assign a
+                                # pending next_spool_id (e.g. from an NFC scan), so re-push once
+                                # it settles rather than leaving Spoolman on the stale value.
                                 self.afc.spool._set_values(
-                                    self, on_done=lambda: self.afc.spool.set_active_spool(self.spool_id))
+                                    self, on_done=lambda: self.afc.spool.set_active_spool(
+                                        self.spool_id))
                                 self.logger.debug(f"Prep: direct load logic done-{self.name}-{self.hub}")
                                 break
 
@@ -1608,22 +1737,28 @@ class AFCLane:
             pwm_value = rpm / (self.max_motor_rpm / (15 + 15 * self.rwd_speed_multi))
         return max(0.0, min(pwm_value, 1.0))  # Clamp the value between 0 and 1
 
-    def enable_weight_timer(self):
+    def enable_weight_timer(self) -> None:
         """
         Helper function to enable weight callback timer, should be called once a lane is loaded
-        to extruder or extruder is switched for multi-toolhead setups.
+        to extruder or extruder is switched for multi-toolhead setups. Does nothing when
+        `track_filament_weight` is disabled.
         """
+        if self.cb_update_weight is None:
+            return
         self.past_extruder_position = self.afc.function.get_extruder_pos(
             None, self.past_extruder_position, self.extruder_obj.toolhead_extruder
         )
         self.reactor.update_timer( self.cb_update_weight, self.reactor.monotonic() + self.UPDATE_WEIGHT_DELAY)
 
-    def disable_weight_timer(self):
+    def disable_weight_timer(self) -> None:
         """
         Helper function to disable weight callback timer for lane and save variables
         to file. Should only be called when lane is unloaded from extruder or when
-        swapping extruders for multi-toolhead setups.
+        swapping extruders for multi-toolhead setups. Does nothing when
+        `track_filament_weight` is disabled.
         """
+        if self.cb_update_weight is None:
+            return
         self.update_weight_callback( None ) # get final movement before disabling timer
         self.reactor.update_timer( self.cb_update_weight, self.reactor.NEVER)
         self.past_extruder_position = -1
@@ -1886,6 +2021,8 @@ class AFCLane:
             sensor_name = sensor if sensor else "toolhead"
             if not sensor_obj.runout_helper.sensor_enabled:
                 self.logger.warning(f"{sensor_name} runout has been detected, but pause and runout detection has been disabled")
+            elif self.extruder_obj.creator5_tool_index is not None:
+                self._creator5_runout()
             elif (self.runout_lane is not None
                   and self.extruder_obj.is_standalone()):
                 # TODO: For now this only works for standalone toolheads, more reboust toolhead
@@ -1970,7 +2107,11 @@ class AFCLane:
             # lane's own send_lane_data() call is responsible for it.
             still_claimed = any(key in lane.map for lane in self.afc.lanes.values())
             if not still_claimed:
-                self.afc.moonraker.remove_database_entry("lane_data", key)
+                try:
+                    self.afc.moonraker.remove_database_entry("lane_data", key)
+                except Exception as e:
+                    # The delete is waited for; a failure must not fail the G-code command
+                    self.logger.debug(f"Could not remove lane_data {key}: {e}")
 
         scan_time = self.td1_data['scan_time'] if 'scan_time' in self.td1_data else ""
         td        = self.td1_data['td']        if 'td'        in self.td1_data else ""
@@ -2039,28 +2180,16 @@ class AFCLane:
         """
         Captures TD-1 data for a lane after being loaded into toolhead. When capturing
         data scan time is ignored as its assumed its scanned when loaded into toolhead.
-        Fetches TD-1 data asynchronously since this runs at the end of every TOOL_LOAD
-        and can't block on the HTTP round trip during a print.
+        Moonraker requests wait cooperatively on the moonraker worker, so reactor
+        callbacks keep running during the HTTP round trips.
         """
-        if not self.afc.td1_present:
-            return
-        if not self.td1_device_id:
-            return
-        if self.afc.moonraker is None:
-            return
-        self.afc.moonraker.get_td1_data_async(self._apply_td1_data_load)
+        if self.afc.check_td1_present():
+            valid = False
+            if self.td1_device_id:
+                valid, _ = self.afc.function.check_for_td1_id(self.td1_device_id)
 
-    def _apply_td1_data_load(self, devices: Optional[dict]) -> None:
-        """
-        Completion callback for get_td1_data_load()'s async TD-1 fetch. Validates
-        the configured device ID against the fetched data, then applies it to this lane.
-        Runs on the reactor thread.
-
-        :param devices: TD-1 devices dict fetched asynchronously, or None on failure
-        """
-        valid, _ = self.afc.function._check_td1_id_in_data(devices, self.td1_device_id)
-        if valid:
-            self.unit_obj._apply_td1_data(self, datetime.now(), devices, ignore_time=True)
+            if valid:
+                self.unit_obj.get_td1_data(self, datetime.now(), ignore_time=True)
 
     def get_td1_data(self):
         """

@@ -71,11 +71,20 @@ class AFCExtruderStats:
     cut_threshold: integer
         Cut threshold set by user in AFC config
     """
-    def __init__(self, extruder_name: str, extruder_obj: AFCExtruder, cut_threshold: int):
+    def __init__(self, extruder_name: str, extruder_obj: AFCExtruder,
+                 cut_threshold: int) -> None:
+        """
+        Initialize ownership and warning state for extruder statistics.
+
+        :param extruder_name: Extruder name used for persisted statistics.
+        :param extruder_obj: Extruder owning these statistics.
+        :param cut_threshold: Configured cut-count warning threshold.
+        """
         self.name = extruder_name
         self.obj  = extruder_obj
         self.logger = extruder_obj.logger
         self.moonraker: AFC_moonraker
+        self._stats_initialized = False
 
         self.cut_total: AFCStats_var
         self.cut_total_since_changed: AFCStats_var
@@ -89,12 +98,13 @@ class AFCExtruderStats:
         self.tc_tool_load: AFCStats_var
 
 
-    def handle_moonraker_stats(self):
+    def handle_moonraker_stats(self) -> None:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Load extruder statistics once, allowing failed initialization to retry.
         """
+        if self._stats_initialized:
+            return
+
         self.moonraker = self.obj.afc.moonraker
         values = self.moonraker.get_afc_stats()
 
@@ -119,8 +129,8 @@ class AFCExtruderStats:
         else:
             self.cut_total                  = AFCStats_var(cut_parent_name, "cut_total", values,
                                                            self.moonraker)
-            self.cut_total_since_changed    = AFCStats_var(cut_parent_name, "cut_total_since_changed", values,
-                                                           self.moonraker)
+            self.cut_total_since_changed    = AFCStats_var(
+                cut_parent_name, "cut_total_since_changed", values, self.moonraker)
             self.last_blade_changed         = AFCStats_var(cut_parent_name, "last_blade_changed", values,
                                                            self.moonraker)
 
@@ -137,6 +147,7 @@ class AFCExtruderStats:
         if self.last_blade_changed.value == 0:
             self.last_blade_changed.value = "N/A"
             self.last_blade_changed.update_database()
+        self._stats_initialized = True
 
     def check_cut_threshold(self):
         """
@@ -269,6 +280,10 @@ class AFCExtruder:
                 raise error(f"{self.fullname} have overlapping led index(s) {list(led_index_intersection)}. Please fix and restart.")
 
         self.tc_unit_name: Optional[str] = config.get("toolchanger_unit", None)
+        # Creator 5 physical head index, presence comes from creator5_toolchanger's mount sensors
+        self.creator5_tool_index: Optional[int] = config.getint("creator5_tool_index", None,
+                                                                minval=0, maxval=3)
+        self.creator5_mount_error: Optional[str] = None
         self.tc_unit_obj: Optional[AfcToolchanger|None] = None
         self.tc_lane: Optional[AFCLane|None]            = None
         self.tool: Optional[str]        = config.get('tool', None)
@@ -281,6 +296,8 @@ class AFCExtruder:
                                                                 self.afc.enable_standalone_purge)
         self.standalone_auto_load_unload: bool  = config.getboolean("standalone_auto_load_unload",
                                                                     self.afc.standalone_auto_load_unload)
+        # Set to False so tool_start triggering only updates lane state without loading filament
+        self.auto_load_on_tool_start: bool = config.getboolean("auto_load_on_tool_start", True)
 
         self.lane_loaded: Optional[str] = None
         self.lanes: Dict                = {}
@@ -641,6 +658,14 @@ class AFCExtruder:
                     if (self.tc_lane._afc_prep_done
                         and not actively_printing):
                         if state:
+                            if not self.auto_load_on_tool_start:
+                                # Only update AFC state without commanding extrusion. A parked
+                                # tool with filament fed into it is not "in use", so only mark
+                                # the lane loaded while this tool is mounted. on_shuttle()
+                                # re-syncs this once the tool is later mounted or docked.
+                                if self.on_shuttle():
+                                    self.tc_lane.set_tool_loaded()
+                                    self.tc_lane.set_loaded()
                             # A extruder config with a custom_load_cmd drives the entire
                             # load including the tool_stn advance to the nozzle
                             # and should also return temp back to starting temp.
@@ -651,8 +676,8 @@ class AFCExtruder:
                             # If this did not exist then an automatic load without this can crash
                             # klipper since more than one thing is trying to control the toolhead
                             # extruder at once.
-                            if (not self.load_active
-                                and not getattr(self.tc_lane, 'custom_load_cmd', None)):
+                            elif (not self.load_active
+                                  and not getattr(self.tc_lane, 'custom_load_cmd', None)):
                                 self.load_unload_sequence(self.tool_stn)
                         else:
                             self.tc_lane.set_tool_unloaded()
@@ -800,11 +825,19 @@ class AFCExtruder:
         When `standalone_auto_load_unload` is disabled, the hotend is not heated and no filament is
         moved; only the lane/extruder variables are updated to reflect the requested
         load/unload state, as if the sequence had completed.
+        Creator 5 heads (`creator5_tool_index` set) have no motorized retract path, so a
+        negative distance only tells the user to cut the filament out manually.
 
         :param distance: distance to load filament, this is set to `self.current_move_distance` so
                          that distance is saved and used in move_extruder function once extruder is
                          up to temperature
         """
+        if (distance < 0
+            and self.creator5_tool_index is not None):
+            self.gcode.respond_info(f"T{self.creator5_tool_index}: use the cutter to remove the "
+                                    "filament; it does not retract automatically.")
+            return
+
         info_str = "Loading" if distance > 0 else "Unloading"
         loaded = bool(distance > 0)
 
@@ -1055,7 +1088,7 @@ class AFCExtruder:
 
         return True, ""
 
-    def on_shuttle(self):
+    def on_shuttle(self) -> bool:
         """
         Helper function to easily detect if a toolhead is on the shuttle or not. This function is
         for toolchangers and will return True for single toolhead printers.
@@ -1063,6 +1096,39 @@ class AFCExtruder:
         :return bool: True if toolheads optotap sensor is triggered. Always returns True for single
                       toolhead printers.
         """
+        # Creator 5 tool presence is determined by its physical dock/grab
+        # switches, not AFC filament state or the selected logical extruder.
+        if self.creator5_tool_index is not None:
+            try:
+                creator5 = self.printer.lookup_object('creator5_toolchanger')
+                attached = creator5.attached_tool_from_pins()
+            except Exception as exc:
+                # Also called from get_status(). A faulty or contradictory
+                # switch must not advertise any mounted tool.
+                self.creator5_mount_error = str(exc)
+                return False
+            self.creator5_mount_error = None
+            mounted = attached == self.creator5_tool_index
+            busy = (AFCLaneState.TOOL_LOADING, AFCLaneState.TOOL_UNLOADING,
+                    AFCLaneState.EJECTING, AFCLaneState.CALIBRATING,
+                    AFCLaneState.INFINITE_RUNOUT, AFCLaneState.ERROR)
+            # Only while the head is its own lane: once a unit's lane feeds it
+            # (an ACE), that lane owns the loaded state
+            if (self.tc_lane is not None
+                and self.no_lanes
+                and self.tc_lane.status not in busy):
+                if (mounted
+                    and self.tool_start_state):
+                    if self.tc_lane.status not in (AFCLaneState.LOADED, AFCLaneState.TOOLED):
+                        if not self.tc_lane.tool_loaded:
+                            self.tc_lane.set_tool_loaded()
+                        self.tc_lane.set_loaded()
+                elif (not mounted
+                      and self.tc_lane.tool_loaded):
+                    if self.tc_lane.status != AFCLaneState.LOADED:
+                        self.tc_lane.set_loaded()
+            return mounted
+
         # Return true if both are not set as this would be for single toolhead
         # setups
         if ( (self.tool_obj is None
@@ -1102,6 +1168,13 @@ class AFCExtruder:
         :param lane: AFCLane for current extruder to easily set leds though its unit object
         :return str: Message string if lane is loaded to toolhead or in toolhead and on shuttle
         """
+        if self.creator5_tool_index is not None:
+            mounted = self.on_shuttle()
+            if self.creator5_mount_error:
+                return "<span class=error--text> mount sensors invalid</span>"
+            if mounted:
+                return "<span class=success--text> mounted</span>"
+            return "<span class=primary--text> parked</span>"
         msg = ""
         on_shuttle = ""
         if (self.tool_obj
@@ -1267,10 +1340,26 @@ class AFCExtruder:
         self.response['tool_end'] = self.tool_end
         self.response['tool_end_status'] = bool(self.tool_end_state)
         self.response['lanes'] = [lane.name for lane in self.lanes.values()]
-        self.response['on_shuttle'] = self.on_shuttle()
+        mounted = self.on_shuttle()
+        self.response['on_shuttle'] = mounted
+        if self.creator5_tool_index is not None:
+            self.response['mount_sensor_error'] = self.creator5_mount_error
         self.response['is_standalone'] = self.is_standalone()
+        self.response['auto_load_on_tool_start'] = self.auto_load_on_tool_start
         self.response['next_pickup'] = self.next_pickup
-        self.response['status'] = self.status
+        if self.creator5_tool_index is None:
+            self.response['status'] = self.status
+        elif (self.creator5_mount_error
+              or self.status == State.ERROR):
+            self.response['status'] = State.ERROR
+        elif not mounted:
+            self.response['status'] = State.PARKED
+        elif self.status in (State.TOOL_DOCK, State.TOOL_PICKUP):
+            self.response['status'] = self.status
+        elif self.afc.function.is_printing():
+            self.response['status'] = State.PRINTING
+        else:
+            self.response['status'] = self.status
 
         return self.response
 

@@ -65,9 +65,9 @@ class afcPrep:
         :prep overrall_status: Status of all the lanes, if error occurred during lane prep TD-1 data
                                will not be captured
         '''
-        capture_td1_data = self.get_td1_data and self.afc.td1_present
+        capture_td1_data = self.get_td1_data and self.afc.check_td1_present()
         any_td1_error = False
-        if self.afc.td1_present:
+        if self.afc.check_td1_present():
             self.logger.info("Found TD-1 device connected to printer")
             any_td1_error, _ = self.afc.function.check_for_td1_error()
 

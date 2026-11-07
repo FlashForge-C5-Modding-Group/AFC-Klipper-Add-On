@@ -28,6 +28,7 @@ from extras.AFC_lane import (
 )
 from extras.AFC_stepper import AFCExtruderStepper
 from tests.conftest import MockAFC, MockLogger
+from tests.test_AFC_moonraker_io import moonraker_io as moonraker_io
 
 
 # ── SpeedMode ─────────────────────────────────────────────────────────────────
@@ -204,6 +205,7 @@ def _make_afc_lane(fullname="AFC_stepper lane1"):
     lane.hub_obj = None
     lane.buffer_obj = None
     lane.extruder_obj = MagicMock()
+    lane.extruder_obj.creator5_tool_index = None
     lane.endstops = {}
     lane.espooler = MagicMock()
     lane.espooler.assist.return_value = False
@@ -348,6 +350,12 @@ class TestSelectorCalDis:
     def test_reads_from_config_when_selector_also_configured(self):
         lane = _make_real_afc_lane(values={"selector": "PA5", "selector_cal_distance": 1.5})
         assert lane.selector_cal_dis == 1.5
+
+
+class TestAFCLaneSpoolRequestGenerationInit:
+    def test_constructor_has_no_pending_spool_assignment(self):
+        lane = _make_real_afc_lane()
+        assert lane._spool_request_generation == 0
 
 
 # ── _get_steppers: stepperless unit early return ─────────────────────────────
@@ -785,79 +793,43 @@ class TestGetTd1DataUnitHook:
         assert "not loaded" in msg.lower()
 
 
-# ── get_td1_data_load / _apply_td1_data_load ──────────────────────────────────
-# Runs at the end of every TOOL_LOAD, so this fetches asynchronously (unlike
-# get_td1_data above, used by calibration/PREP capture, which stays synchronous).
+# ── get_td1_data_load ─────────────────────────────────────────────────────────
+# Runs at the end of every TOOL_LOAD. Its Moonraker queries wait cooperatively on
+# the FIFO worker, so the device check and capture run inline in order.
 
 class TestGetTd1DataLoad:
-    def _make(self, td1_present=True, td1_device_id="SN1"):
+    def _make(self, td1_present=True, td1_device_id="SN1", device_valid=True):
         lane = _make_afc_lane()
-        lane.afc.td1_present = td1_present
+        lane.afc.check_td1_present.return_value = td1_present
+        lane.afc.function.check_for_td1_id.return_value = (device_valid, "")
         lane.td1_device_id = td1_device_id
-        lane.afc.moonraker = MagicMock()
         return lane
 
     def test_td1_not_present_skips_entirely(self):
         lane = self._make(td1_present=False)
         lane.get_td1_data_load()
-        lane.afc.moonraker.get_td1_data_async.assert_not_called()
+        lane.afc.function.check_for_td1_id.assert_not_called()
+        lane.unit_obj.get_td1_data.assert_not_called()
 
     def test_no_device_id_skips_entirely(self):
         lane = self._make(td1_device_id=None)
         lane.get_td1_data_load()
-        lane.afc.moonraker.get_td1_data_async.assert_not_called()
+        lane.afc.function.check_for_td1_id.assert_not_called()
+        lane.unit_obj.get_td1_data.assert_not_called()
 
-    def test_no_moonraker_skips_entirely(self):
-        lane = self._make()
-        lane.afc.moonraker = None
-        lane.get_td1_data_load()  # must not raise
+    def test_invalid_device_skips_capture(self):
+        lane = self._make(device_valid=False)
+        lane.get_td1_data_load()
+        lane.afc.function.check_for_td1_id.assert_called_once_with("SN1")
+        lane.unit_obj.get_td1_data.assert_not_called()
 
-    def test_dispatches_async_fetch_with_apply_callback(self):
+    def test_valid_device_captures_with_ignore_time(self):
         lane = self._make()
         lane.get_td1_data_load()
-        lane.afc.moonraker.get_td1_data_async.assert_called_once_with(
-            lane._apply_td1_data_load)
-
-
-class TestApplyTd1DataLoad:
-    def _make(self, td1_device_id="SN1"):
-        lane = _make_afc_lane()
-        lane.td1_device_id = td1_device_id
-        lane.unit_obj = MagicMock()
-        return lane
-
-    def test_invalid_device_skips_apply(self):
-        lane = self._make()
-        lane.afc.function._check_td1_id_in_data.return_value = (False, "not found")
-
-        lane._apply_td1_data_load({"OTHER": {}})
-
-        lane.afc.function._check_td1_id_in_data.assert_called_once_with({"OTHER": {}}, "SN1")
-        lane.unit_obj._apply_td1_data.assert_not_called()
-
-    def test_valid_device_applies_with_ignore_time(self):
-        lane = self._make()
-        lane.afc.function._check_td1_id_in_data.return_value = (True, "")
-        devices = {"SN1": {"td": "PLA", "color": "#FF0000", "scan_time": "2024-01-01T12:00:00Z"}}
-
-        lane._apply_td1_data_load(devices)
-
-        args = lane.unit_obj._apply_td1_data.call_args[0]
-        assert args[0] is lane
-        assert args[2] == devices
-        kwargs = lane.unit_obj._apply_td1_data.call_args[1]
-        assert kwargs.get("ignore_time") is True
-
-    def test_none_devices_from_failed_fetch_is_treated_as_invalid(self):
-        """A failed async fetch delivers None; _check_td1_id_in_data already
-        handles that (device can't be found in no data), so apply is skipped."""
-        lane = self._make()
-        lane.afc.function._check_td1_id_in_data.return_value = (False, "not found")
-
-        lane._apply_td1_data_load(None)
-
-        lane.afc.function._check_td1_id_in_data.assert_called_once_with(None, "SN1")
-        lane.unit_obj._apply_td1_data.assert_not_called()
+        lane.afc.function.check_for_td1_id.assert_called_once_with("SN1")
+        args = lane.unit_obj.get_td1_data.call_args
+        assert args.args[0] is lane
+        assert args.kwargs == {"ignore_time": True}
 
 
 # ── handle_load_runout ────────────────────────────────────────────────────────
@@ -1472,6 +1444,55 @@ class TestAFCLaneMaterial:
         """'PLA+' should match 'PLA' entry."""
         lane = _make_lane_with_afc()
         lane.material = "PLA+"
+        assert lane.filament_density == 1.24
+
+    @pytest.mark.parametrize("material, densities", [
+        ({"PLA": True}, ["PLA:1.24"]),
+        ("PLA", ["PLA:broken"]),
+    ])
+    def test_invalid_material_density_does_not_partially_change_material(
+        self, material, densities
+    ):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = densities
+        lane._material = "PETG"
+        lane.filament_density = 1.27
+        with pytest.raises(ValueError):
+            lane.material = material
+        assert lane.material == "PETG"
+        assert lane.filament_density == 1.27
+
+
+class TestAFCLaneGetMaterialDensity:
+    @pytest.mark.parametrize("value, expected", [
+        (None, 1.24), ("", 1.24), ("PETG", 1.27), ("NYLON", 1.31),
+    ])
+    def test_preflight_returns_density_without_assignments(self, value, expected):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.24", "PETG:1.27"]
+        lane._material = "OLD"
+        lane.filament_density = 1.31
+        assert lane._get_material_density(value) == expected
+        assert lane.material == "OLD"
+        assert lane.filament_density == 1.31
+
+    @pytest.mark.parametrize("value", [True, 7, {}, ["PLA"]])
+    def test_non_text_material_is_rejected_before_assignments(self, value):
+        lane = _make_real_afc_lane()
+        lane._material = None
+        lane.filament_density = 1.24
+        with pytest.raises(ValueError, match="^Filament material must be text or None$"):
+            lane._get_material_density(value)
+        assert lane.material is None
+        assert lane.filament_density == 1.24
+
+    def test_first_material_match_wins(self):
+        lane = _make_real_afc_lane()
+        lane.afc.common_density_values = ["PLA:1.25", "PLA+:1.29"]
+        lane._material = None
+        lane.filament_density = 1.24
+        assert lane._get_material_density("PLA+") == 1.25
+        assert lane.material is None
         assert lane.filament_density == 1.24
 
 
@@ -4166,6 +4187,14 @@ class TestPrepCallback:
         from an NFC scan). The on_done callback passed to _set_values must
         re-push using the settled spool_id, and must not fire eagerly."""
         lane = _make_lane_ready_to_load()
+        from tests.test_AFC_spool import _make_spool
+        spool = _make_spool()
+        spool.afc = lane.afc
+        spool._set_values = MagicMock()
+        spool.set_active_spool = MagicMock()
+        lane.afc.spool = spool
+        lane.afc.lanes = {lane.name: lane}
+        lane.afc.current = lane.name
         lane.hub = "direct_load"
         lane.afc.TOOL_LOAD.return_value = True
         lane.prep_callback(10, True)
@@ -4493,3 +4522,82 @@ class TestAFCLaneLedColorValidation:
     def test_valid_color_stored_on_attribute(self, option):
         lane = _make_real_afc_lane(values={option: "0.2,0.4,0.6,0.8"})
         assert getattr(lane, self.OPTIONS[option]) == "0.2,0.4,0.6,0.8"
+
+
+class TestAFCLaneHandleMoonrakerConnect:
+    @pytest.mark.parametrize(("unit_type", "fullname", "admitted"), [
+        ("BoxTurtle", "AFC_stepper lane1", True),
+        ("HTLF", "AFC_stepper lane1", False),
+        ("HTLF", "AFC_lane lane1", True),
+    ])
+    def test_repeated_prep_retains_count_and_repeats_other_setup(
+            self, moonraker_io, unit_type, fullname, admitted):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.fullname = fullname
+        lane.unit_obj = MagicMock(type=unit_type)
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.td1_when_loaded = True
+        io.client.get_afc_stats = io.startup_stats
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        with patch.object(lane.espooler, "handle_moonraker_connect",
+                          wraps=lane.espooler.handle_moonraker_connect) as connect:
+            lane.handle_moonraker_connect()
+            if admitted:
+                counter = lane.lane_load_count
+                counter.increase_count()
+                counter.increase_count()
+                counter.reset_count()
+                counter.increase_count()
+            lane.afc.td1_defined = False
+            lane.handle_moonraker_connect()
+        if admitted:
+            assert lane.lane_load_count is counter
+            assert counter.value == 1
+            assert connect.call_count == 2
+            assert lane.td1_when_loaded is False
+            assert io.startup_reads == 2
+            io.wait_idle()
+            assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        else:
+            assert lane.lane_load_count is None
+            assert connect.call_count == 0
+            assert lane.td1_when_loaded is True
+            assert io.startup_reads == 0
+            assert io.records == []
+        assert io.logger.messages == []
+
+    def test_failed_stat_initialization_retries_lane_and_espooler(self, moonraker_io):
+        from extras.AFC_assist import AFCEspoolerStats
+
+        io = moonraker_io
+        lane = _make_real_afc_lane()
+        lane.unit_obj = MagicMock(type="BoxTurtle")
+        lane.afc.moonraker = io.client
+        lane.afc.td1_defined = True
+        lane.espooler.stats = AFCEspoolerStats(lane.name, lane.espooler)
+        attempts = []
+
+        def startup():
+            attempts.append("read")
+            if len(attempts) == 1:
+                raise ValueError("controlled startup read failure")
+            return None
+
+        io.client.get_afc_stats = startup
+        with pytest.raises(ValueError, match="controlled startup read failure"):
+            lane.handle_moonraker_connect()
+        assert lane.lane_load_count is None
+        lane.handle_moonraker_connect()
+        counter = lane.lane_load_count
+        counter.increase_count()
+        lane.handle_moonraker_connect()
+        assert lane.lane_load_count is counter
+        assert counter.value == 1
+        assert attempts == ["read", "read", "read"]
+        io.wait_idle()
+        assert io.contents == {("afc_stats", "lane1.load_count"): "1"}
+        assert io.logger.messages == []

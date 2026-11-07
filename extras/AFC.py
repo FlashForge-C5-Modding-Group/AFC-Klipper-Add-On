@@ -64,6 +64,8 @@ AFC_VERSION="1.2.10"
 class State(str, Enum):
     INIT            = "Initialized"
     IDLE            = "Idle"
+    PARKED          = "Parked"
+    PRINTING        = "Printing"
     ERROR           = "Error"
     LOADING         = "Loading"
     UNLOADING       = "Unloading"
@@ -84,7 +86,12 @@ def load_config(config):
 
 class afc:
     class sentinel: pass
-    def __init__(self, config: ConfigWrapper):
+    def __init__(self, config: ConfigWrapper) -> None:
+        """
+        Initialize AFC configuration, services, and statistics ownership.
+
+        :param config: AFC configuration section.
+        """
         self.config  = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
@@ -117,10 +124,12 @@ class afc:
         self.position_saved     = False
         self.spoolman           = None
         self.moonraker: Optional[AFC_moonraker] = None
+        self.afc_stats: Optional[AFCStats] = None
         self.print_data_metadata : Optional[AFC_PrintFileMetaData] = None
         self.td1_defined        = False
         self._td1_present       = False
         self._last_td1_query:float    = 0
+        self._td1_query_completion: Optional[Any] = None
         self.lane_data_enabled  = False
         self.prep_done          = False         # Variable used to hold of save_vars function from saving too early and overriding save before prep can be ran
         self.last_prep_activity_time = 0.0  # eventtime of the last PREP edge on any lane
@@ -166,14 +175,20 @@ class afc:
         self.moonraker_port         = config.get("moonraker_port", 7125)             # Port to connect to when interacting with moonraker. Used when there are multiple moonraker/klipper instances on a single host
         self.moonraker_host         = config.get("moonraker_host", "http://localhost")
         self.moonraker_connect_to   = config.get("moonraker_timeout", 30)
+        # Query slicer metadata (toolchange count, per-tool temperatures) after a print starts
+        self.enable_print_metadata  = config.getboolean("enable_print_metadata", True)
+        # Seconds after a print file starts before checking print state and querying its metadata
+        self.print_metadata_delay   = config.getfloat("print_metadata_delay", 5., above=0.)
         self.unit_order_list        = config.get('unit_order_list','')
-        self.VarFile                = config.get('VarFile','../printer_data/config/AFC/AFC.var')# Path to the variables file for AFC configuration.
+        # Path to the variables file for AFC configuration, `~` expands to the user's home directory
+        self.VarFile                = os.path.expanduser(
+            config.get('VarFile', '../printer_data/config/AFC/AFC.var'))
         self.cfgloc                 = self._remove_after_last(self.VarFile,"/")
 
         # save_vars() only builds the state dict on the reactor thread; the actual file
         # write happens on this background thread so a slow disk can't stall Klipper.
         # A single worker is created rather than a thread per call to keep writes ordered.
-        self._var_write_thread_wait = True
+        self._var_writer_closed = False
         self._var_write_queue: Queue = Queue()
         self._var_write_thread = threading.Thread(target=self._var_write_worker, daemon=True,
                                                   name="afc_save_vars")
@@ -195,6 +210,14 @@ class afc:
         # Auto spool switch settings
         self.auto_spool_switch: bool              = config.getboolean("auto_spool_switch", False)                    # Trigger spool switch based on remaining filament weight
         self.auto_spool_switch_threshold: float   = config.getfloat("auto_spool_switch_threshold", 25.0, minval=0.)  # Weight threshold in grams
+        # Track remaining spool weight from extruder movement
+        self.track_filament_weight: bool = config.getboolean("track_filament_weight", True)
+        # Query moonraker for TD-1 devices
+        self.enable_td1_detection: bool  = config.getboolean("enable_td1_detection", True)
+        if (self.auto_spool_switch
+            and not self.track_filament_weight):
+            error_string = "auto_spool_switch requires track_filament_weight"
+            raise config.error(error_string)
 
         #LED SETTINGS
         # All variables use: (R,G,B,W) 0 = off, 1 = full brightness.
@@ -374,11 +397,31 @@ class afc:
         update_trsync = config.getboolean("trsync_update", False)                   # Set to true to enable updating trsync value in klipper mcu. Enabling this and updating the timeouts can help with Timer Too Close(TTC) errors
         if update_trsync:
             try:
-                import mcu
                 trsync_value = config.getfloat("trsync_timeout", 0.05)              # Timeout value to update in klipper mcu. Klipper's default value is 0.025
                 trsync_single_value = config.getfloat("trsync_single_timeout", 0.5) # Single timeout value to update in klipper mcu. Klipper's default value is 0.250
                 self.logger.info("Applying TRSYNC update")
 
+                # Kalico keeps its trsync timeouts in [danger_options] instead of mcu module
+                # values. Kalico loads the singleton as klippy.extras.danger_options; the
+                # top-level name is its compat alias, or the module itself on pre-package
+                # Danger Klipper. On Klipper both imports fail and the mcu module is updated.
+                try:
+                    from klippy.extras.danger_options import get_danger_options
+                except ImportError:
+                    try:
+                        from extras.danger_options import get_danger_options
+                    except ImportError:
+                        get_danger_options = None
+
+                if get_danger_options is not None:
+                    options = get_danger_options()
+                    options.multi_mcu_trsync_timeout = max(options.multi_mcu_trsync_timeout,
+                                                           trsync_value)
+                    options.single_mcu_trsync_timeout = max(options.single_mcu_trsync_timeout,
+                                                            trsync_single_value)
+                    return
+
+                import mcu
                 # Making sure value exists as kalico(danger klipper) does not have TRSYNC_TIMEOUT value
                 if hasattr(mcu, "TRSYNC_TIMEOUT"): mcu.TRSYNC_TIMEOUT = max(mcu.TRSYNC_TIMEOUT, trsync_value)
                 else : self.logger.info("TRSYNC_TIMEOUT does not exist in mcu file, not updating")
@@ -414,16 +457,17 @@ class afc:
         if lane_obj.unit_obj.type != "ViViD":
             self.gcode.register_mux_command('HUB_LOAD',     "LANE", lane_obj.name, self.cmd_HUB_LOAD,       desc=self.cmd_HUB_LOAD_help)
 
-    def handle_moonraker_connect(self):
+    def handle_moonraker_connect(self) -> Optional[bool]:
         """
-        Function that should be called at the beginning of PREP so that moonraker has
-        enough time to start before AFC tries to connect. This fixes a race condition that can
-        happen between klipper and moonraker when first starting up.
+        Prepare Moonraker services while retaining initialized statistics.
+
+        :return Optional[bool]: False when Moonraker is not ready, otherwise None.
         """
 
         try:
-            self.moonraker = AFC_moonraker(self.moonraker_host, self.moonraker_port, self.logger,
-                                           self.reactor)
+            if self.moonraker is None:
+                self.moonraker = AFC_moonraker(
+                    self.moonraker_host, self.moonraker_port, self.logger, self.reactor)
             if not self.moonraker.wait_for_moonraker(toolhead=self.toolhead,
                                                      timeout=self.moonraker_connect_to):
                 return False
@@ -440,14 +484,18 @@ class afc:
                         break
 
                     self.toolhead.dwell(1)
-            self.td1_defined, self._td1_present, self.lane_data_enabled = self.moonraker.check_for_td1()
-            self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
+            if self.enable_td1_detection:
+                (self.td1_defined, self._td1_present,
+                 self.lane_data_enabled) = self.moonraker.check_for_td1()
+            if self.afc_stats is None:
+                self.afc_stats = AFCStats(self.moonraker, self.logger, len(self.tools) > 1)
             self.print_data_metadata = AFC_PrintFileMetaData(moonraker=self.moonraker,
                                                              logger=self.logger)
 
             self.printer.send_event("afc:moonraker_connect")
         except Exception as e:
-            self.logger.debug("Moonraker/Spoolman/afc_stats/td1 error\nError: {}\n{}".format(e, traceback.format_exc()))
+            self.logger.debug(
+                f"Moonraker/Spoolman/afc_stats/td1 error\nError: {e}\n{traceback.format_exc()}")
             self.spoolman = None                      # set to none if not found
 
     def handle_connect(self):
@@ -546,12 +594,15 @@ class afc:
         self.function._rename(self.BASE_M104, self.RENAMED_M104, self.cmd_AFC_M104, self.cmd_AFC_M104_help)
         self.function._rename(self.BASE_M109, self.RENAMED_M109, self.cmd_AFC_M109, self.cmd_AFC_M109_help)
 
-    def print_version(self, console_only=False):
+    @cached_property
+    def version_string(self) -> str:
         """
-        Calculated AFC git version and displays to console and log
+        AFC version with the git commit count and hash of the AFC checkout. Git is only queried
+        once, so repeated PREP runs do not block the reactor on subprocess calls.
+
+        :return str: Version string displayed by print_version
         """
         import subprocess
-        import os
         afc_dir  = os.path.dirname(os.path.realpath(__file__))
         git_hash = '_'
         git_commit_num = '_'
@@ -561,9 +612,15 @@ class afc:
         except:
             self.logger.debug(f"Error fetching repo info: {traceback.format_exc()}")
 
-        string  = "AFC Version: v{}-{}-{}".format(AFC_VERSION, git_commit_num, git_hash)
+        return f"AFC Version: v{AFC_VERSION}-{git_commit_num}-{git_hash}"
 
-        self.logger.info(string, console_only)
+    def print_version(self, console_only: bool = False) -> None:
+        """
+        Displays the AFC git version to console and log
+
+        :param console_only: Only display the version in the console
+        """
+        self.logger.info(self.version_string, console_only)
 
     def verify_macro_positions(self) -> str:
         """
@@ -622,27 +679,93 @@ class afc:
         return error_str
 
     @property
-    def td1_present(self):
-        present = self._td1_present
+    def td1_present(self) -> bool:
+        """
+        Schedule an eligible refresh without waiting during status construction.
+
+        :return bool: Cached TD-1 presence, always False when `enable_td1_detection` is disabled
+        """
+        if not self.enable_td1_detection:
+            return False
+        self._schedule_td1_refresh()
+        return self._td1_present
+
+    def _schedule_td1_refresh(self) -> Optional[Any]:
+        """
+        Share one pending presence refresh while respecting the idle refresh interval.
+
+        :return Optional[Any]: Pending completion, or None when no refresh is eligible
+        """
+        if not self.enable_td1_detection:
+            return None
+        if self._td1_query_completion is not None:
+            return self._td1_query_completion
         current_time = self.reactor.monotonic()
-        if (self.printer.state_message == 'Printer is ready'
-            and self.moonraker is not None
-            and (current_time - self._last_td1_query) > 30 ):
-            if not self.function.is_printing(check_movement=True):
-                self._last_td1_query = current_time
-                present = self.moonraker.check_for_td1()[1]
-                self._td1_present = present
+        client = self.moonraker
+        if (self.printer.state_message != 'Printer is ready'
+            or client is None
+            or client._closing
+            or (current_time - self._last_td1_query) <= 30
+            or self.function.is_printing(check_movement=True)):
+            return None
+        completion = self.reactor.completion()
+        self._td1_query_completion = completion
+        self._last_td1_query = current_time
+        self.reactor.register_async_callback(
+            lambda eventtime: self._refresh_td1_present(eventtime, completion, client))
+        return completion
 
-        return present
-
-    def _reset_file_callback(self):
+    def _refresh_td1_present(self, eventtime: float, completion: Any,
+                             client: AFC_moonraker) -> None:
         """
-        Set timer to check back to see if printer is printing. This is needed as file and print status is set after
-        this callback.
+        Refresh presence cooperatively without modifying a replaced or closed owner.
 
-        AFC errors are also reset as well as pause states are cleared in klipper's pause_resume module
+        :param eventtime: Reactor callback time, unused
+        :param completion: Completion shared by operational presence callers
+        :param client: Moonraker client captured when this refresh was scheduled
         """
-        self.in_print_timer = self.reactor.register_timer( self.in_print_reactor_timer, self.reactor.monotonic() + 5 )
+        try:
+            if (self.enable_td1_detection
+                and self.printer.state_message == 'Printer is ready'
+                and client is self.moonraker
+                and not client._closing
+                and not self.function.is_printing(check_movement=True)):
+                present = client.check_for_td1()[1]
+                if (client is self.moonraker
+                    and not client._closing):
+                    self._td1_present = present
+        except Exception:
+            self.logger.error("TD-1 presence refresh failed", traceback=traceback.format_exc())
+        finally:
+            if self._td1_query_completion is completion:
+                self._td1_query_completion = None
+            completion.complete(self._td1_present)
+
+    def check_td1_present(self) -> bool:
+        """
+        Wait cooperatively for an eligible or already-pending presence refresh.
+
+        :return bool: Current presence after the shared refresh, or the cached value. Always
+                      False when `enable_td1_detection` is disabled
+        """
+        if not self.enable_td1_detection:
+            return False
+        completion = self._schedule_td1_refresh()
+        if completion is not None:
+            return completion.wait()
+        return self._td1_present
+
+    def _reset_file_callback(self) -> None:
+        """
+        Reset print bookkeeping and replace the delayed metadata timer at a file boundary.
+        The metadata timer is not started when `enable_print_metadata` is disabled.
+        """
+        if self.in_print_timer is not None:
+            self.reactor.unregister_timer(self.in_print_timer)
+            self.in_print_timer = None
+        if self.enable_print_metadata:
+            self.in_print_timer = self.reactor.register_timer(
+                self.in_print_reactor_timer, self.reactor.monotonic() + self.print_metadata_delay)
         self.error.reset_failure()
         self.gcode.run_script_from_command("CLEAR_PAUSE")
         self.number_of_toolchanges = 0
@@ -652,56 +775,51 @@ class afc:
             self.print_data_metadata.reset()
         self.save_vars()
 
-    def in_print_reactor_timer(self, eventtime):
+    def in_print_reactor_timer(self, eventtime: float) -> float:
         """
-        Print timer callback to check if printer is currently in a print. If printer is in a print,
-        current filename is looked up and metadata is pulled from moonraker to get total filament change
-        count and per-tool temperatures.
+        Initialize print fault tracking before starting an asynchronous metadata query.
 
-        Metadata is fetched asynchronously since this reactor timer runs while printing and shouldn't
-        block on the HTTP round trip to moonraker. _finish_print_start runs once it's ready
-        (or immediately if there's no moonraker to query). Once this is done timer callback is
-        stopped and unregistered.
+        :param eventtime: Reactor callback time, unused
+        :return float: Reactor NEVER value after unregistering this timer
         """
-        # Remove timer from reactor
-        self.reactor.unregister_timer(self.in_print_timer)
+        if self.in_print_timer is not None:
+            self.reactor.unregister_timer(self.in_print_timer)
+            self.in_print_timer = None
         # Check to see if printer is printing and return filament
         in_print, print_filename = self.function.in_print(return_file=True)
-        self.logger.debug("In print: {}, Filename: {}".format(in_print, print_filename))
+        self.logger.debug(f"In print: {in_print}, Filename: {print_filename}")
         if in_print:
             self.number_of_toolchanges = 0
+            current_lane = self.function.get_current_lane_obj()
+            if (current_lane
+                and current_lane.buffer_obj is not None):
+                current_lane.buffer_obj.update_filament_error_pos()
+            metadata = self.print_data_metadata
             if (self.moonraker is not None
-                and self.print_data_metadata):
-                self.print_data_metadata.query_filename(print_filename,
-                                                        on_fetched=self._finish_print_start)
+                and metadata is not None):
+                metadata.query_filename(
+                    print_filename,
+                    on_fetched=lambda: self._finish_print_start(metadata, print_filename))
             else:
-                self._finish_print_start()
+                self._finish_print_start(metadata, print_filename)
 
         return self.reactor.NEVER
 
-    def _finish_print_start(self) -> None:
+    def _finish_print_start(self, metadata: Optional[AFC_PrintFileMetaData],
+                            filename: str) -> None:
         """
-        Completes print-start moonraker file metadata query: applies the toolchange count and
-        per-tool temperatures cached by print_data_metadata (if a query was made). Resets
-        current_toolchange, and resets the current lane's fault-detection position.
+        Apply current print metadata without resetting progressed tool or fault state.
 
-        Runs either immediately from in_print_reactor_timer (no moonraker/print_data_metadata to
-        query) or from the completion callback once print_data_metadata.query_filename()
-        finishes fetching metadata.
+        :param metadata: Metadata owner captured when this print query started
+        :param filename: Print filename captured when the timer fired
         """
-        if (self.moonraker is not None
-            and self.print_data_metadata):
-            self.number_of_toolchanges = self.print_data_metadata.tool_change_count
-            self.print_tool_temperatures = self.print_data_metadata.tool_temperatures
-        self.current_toolchange     = -1 # Reset
-        self.logger.info("Total number of toolchanges set to {}".format(self.number_of_toolchanges))
-
-        # Get current lane and update position to reset fault detection as sometimes
-        # purging in PRINT_START can lead to false positive detections
-        current_lane = self.function.get_current_lane_obj()
-        if current_lane:
-            if current_lane.buffer_obj is not None:
-                current_lane.buffer_obj.update_filament_error_pos()
+        if (metadata is not self.print_data_metadata
+            or self.function.in_print(return_file=True) != (True, filename)):
+            return
+        if metadata is not None:
+            self.number_of_toolchanges = metadata.tool_change_count
+            self.print_tool_temperatures = metadata.tool_temperatures
+        self.logger.info(f"Total number of toolchanges set to {self.number_of_toolchanges}")
 
     def _get_default_material_temps(self, cur_lane):
         """
@@ -1243,12 +1361,15 @@ class afc:
                 f"in toolchange: {self.in_toolchange}, POS: "
             )
 
-    def restore_pos(self, move_z_first=True):
+    def restore_pos(self, move_z_first: bool = True, keep_offsets: bool = False) -> None:
         """
         restore_pos function restores the previous saved position, speed and coord type. The resume uses
         the z_hop value to lift, move to previous x,y coords, then lower to saved z position.
 
         :param move_z_first: Enable to move z before moving x,y
+        :param keep_offsets: Keep the current gcode offsets (a different tool was picked up) and
+                             return to the saved position in gcode coordinates. Without
+                             move_z_first, the XY return is never made below the saved height
         """
         # Only restore position if a valid position was saved, otherwise just return
         if not self.position_saved:
@@ -1259,6 +1380,11 @@ class afc:
             )
             return
 
+        delta = [0., 0., 0.]
+        if keep_offsets:
+            delta = [self.gcode_move.homing_position[i] - self.homing_position[i]
+                     for i in range(3)]
+        target = [self.last_gcode_position[i] + delta[i] for i in range(3)]
         # Only rounded for the log message below, restore logic below uses full precision
         msg = f"Restoring Position {round_floats(self.last_toolhead_position)}"
         msg += f" Base position: {round_floats(self.base_position)}"
@@ -1277,16 +1403,24 @@ class afc:
 
         # Move toolhead to previous z location with z-hop added
         if move_z_first:
-            newpos[2] = self.move_z_pos(self.last_gcode_position[2] + self.z_hop, "restore_pos")
+            newpos[2] = self.move_z_pos(target[2] + self.z_hop, "restore_pos")
+        elif (keep_offsets
+              and newpos[2] < target[2] + self.z_hop):
+            # Keep the current height for the XY return, but never below the saved one: a new
+            # tool whose nozzle sits lower would otherwise cross the print below its last layer
+            newpos[2] = self.move_z_pos(target[2] + self.z_hop, "restore_pos")
 
         # Move to previous x,y location
-        newpos[:2] = self.last_gcode_position[:2]
+        newpos[:2] = target[:2]
         self.gcode_move.move_with_transform(newpos, self._get_resume_speed() )
         self.function.log_toolhead_pos("Resume prev xy: ")
 
         # Update GCODE STATE variables
         self.gcode_move.base_position       = list(self.base_position)
         self.gcode_move.homing_position     = list(self.homing_position)
+        for i in range(3):
+            self.gcode_move.base_position[i]   += delta[i]
+            self.gcode_move.homing_position[i] += delta[i]
 
         # Restore absolute coords
         self.gcode_move.absolute_coord      = self.absolute_coord
@@ -1298,7 +1432,7 @@ class afc:
         # Restore the relative E position
         e_diff = self.gcode_move.last_position[3] - self.last_gcode_position[3]
         self.gcode_move.base_position[3] += e_diff
-        self.gcode_move.last_position[:3] = self.last_gcode_position[:3]
+        self.gcode_move.last_position[:3] = target
 
         # Return to previous xyz
         self.gcode_move.move_with_transform(self.gcode_move.last_position,
@@ -1345,26 +1479,31 @@ class afc:
                 extruder_entry = str["system"]["extruders"][cur_extruder.name]
                 extruder_entry['virtual_tool_start'] = bool(cur_extruder.tool_start_state)
 
+        if self._var_writer_closed:
+            # Writer already drained at disconnect, persist this final state directly
+            self._write_vars_snapshot(str)
+            return
         # Handing off to the background writer thread so a slow disk doesn't
         # block the reactor; queue.put_nowait never blocks the caller here
         self._var_write_queue.put_nowait(str)
 
     def join_threads(self) -> None:
         """
-        Method is called when a klipper:disconnect happens so that all threads can be cleaned up
-        correctly
+        Called on klipper:disconnect. Finishes every queued AFC.var.unit write, then attempts
+        admitted Moonraker work, after the reactor stops. Safe to call more than once.
         """
-        self._var_write_queue.put_nowait(self.sentinel)
-        self._var_write_thread_wait = False
+        if not self._var_writer_closed:
+            self._var_writer_closed = True
+            self._var_write_queue.put_nowait(self.sentinel)
         self._var_write_thread.join()
         if self.moonraker is not None:
             self.moonraker.join_thread()
 
     def _var_write_worker(self) -> None:
         """
-        Background thread loop that pulls queued save_vars() values and
-        writes them to VarFile.unit file in the order they were queued. Runs for
-        the life of the process (daemon thread) so it needs no explicit shutdown.
+        Background thread loop that pulls queued save_vars() values and writes them to
+        VarFile.unit file in the order they were queued, until the disconnect sentinel is
+        dequeued so every earlier snapshot is written first.
         """
         try:
             thread_name = threading.current_thread().name
@@ -1372,7 +1511,7 @@ class afc:
         except:
             pass
 
-        while self._var_write_thread_wait:
+        while True:
             data = self._var_write_queue.get()
             if data is self.sentinel:
                 return
@@ -2602,7 +2741,37 @@ class afc:
         else:
             self.error.AFC_error(f"Error trying to lookup lane for {Tcmd}")
 
+    def _creator5_change_tool(self, cur_lane: AFCLane, restore_pos: bool) -> None:
+        """
+        Creator 5 swaps complete heads, so a T command only performs the physical tool swap.
+        AFC's usual CHANGE_TOOL path would unload and reload filament through the shared
+        extruder during every T command.
+
+        :param cur_lane: Lane whose head should be mounted
+        :param restore_pos: Return to the saved print position after the swap
+        """
+        self.afcDeltaTime.set_start_time()
+        was_saved = self.position_saved
+        self.save_pos()
+        saved_here = self.position_saved and not was_saved
+        was_changing = self.in_toolchange
+        self.in_toolchange = True
+        try:
+            cur_lane.tool_swap()
+            if (restore_pos
+                and saved_here):
+                # Creator 5 raises Z to safe_z for tool travel. Keep that clearance for the XY
+                # return (restore_pos lifts first if the new nozzle would be below the print),
+                # then descend at the saved print position instead of lowering first.
+                self.restore_pos(move_z_first=False, keep_offsets=True)
+        finally:
+            self.in_toolchange = was_changing
+            self.afcDeltaTime.log_total_time("Total change time:")
+
     def CHANGE_TOOL(self, cur_lane: AFCLane, purge_length: Optional[float]=None, restore_pos: bool=True, new_extruder_temp: Optional[float]=None) -> None:
+        if cur_lane.extruder_obj.creator5_tool_index is not None:
+            self._creator5_change_tool(cur_lane, restore_pos)
+            return
         try:
             self.afcDeltaTime.set_start_time()
             # Check if the bypass filament sensor detects filament; if so, abort the tool change.

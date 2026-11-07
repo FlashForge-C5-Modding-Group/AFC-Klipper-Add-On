@@ -4421,6 +4421,42 @@ class TestAfcACEAceLoadInner:
         assert unit.logger.messages == []
         assert unit.afc.afcDeltaTime.messages == []
 
+    def test_sensor_to_gears_feeds_then_catches_in_order(self):
+        unit, lane = self._staged(sensor_to_gears=300, sensor_to_gears_catch=100,
+                                  sensor_to_gears_speed=17, use_feed_assist=False)
+        lane.extruder_obj.tool_stn = 0
+        self._wire(unit, lane, sensor_on=1)
+
+        assert unit._ace_load_inner(lane, lane.extruder_obj) is True
+
+        moves = [entry for entry in unit.printer.timeline
+                 if entry[0] == "move_e_pos"
+                 or (entry[0] == "send_command" and entry[1][0] == "feed_filament")]
+        assert moves == [
+            ("send_command", self._feed(3870, 80)),
+            ("send_command", self._feed(200, 17)),
+            ("send_command", self._feed(100, 25)),
+            ("move_e_pos", (100, 25, "gear catch", False))]
+        assert unit.afc.toolhead.wait_moves.calls == [((), {})]
+        assert unit.afc.error.handle_lane_failure.calls == []
+        assert unit.logger.messages == [
+            self.AT_SENSOR,
+            ("info", "ACE load: pushing lane3 200mm on towards the gears, "
+                     "then 100mm with the extruder")]
+
+    def test_zero_sensor_to_gears_skips_push(self):
+        unit, lane = self._staged(sensor_to_gears=0, sensor_to_gears_catch=100,
+                                  use_feed_assist=False)
+        lane.extruder_obj.tool_stn = 0
+        wire = self._wire(unit, lane, sensor_on=1)
+
+        assert unit._ace_load_inner(lane, lane.extruder_obj) is True
+
+        assert wire.moves() == [self._feed(3870, 80)]
+        assert unit.afc.move_e_pos.calls == []
+        assert unit.afc.toolhead.wait_moves.calls == []
+        assert unit.logger.messages == [self.AT_SENSOR]
+
     def test_success_marks_loaded_and_returns_true(self):
         unit = ace_p1_unit(LaneSpec("lane0", prep=True))
         lane = unit.lanes["lane0"]
@@ -4717,6 +4753,205 @@ class TestAfcACEAceLoadInner:
         assert len(calls) == 3
         assert wire.moves() == [self._feed(3900.0, 80.0), self._feed(100.0, 50.0)]
         assert unit.afc.error.handle_lane_failure.calls == []
+
+
+class TestAfcACEPushToGears:
+    def test_catch_is_capped_at_total_distance(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=40,
+                                                    sensor_to_gears_catch=100)
+        wire = AceP1Wire(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is True
+
+        assert wire.moves() == [("feed_filament", {"index": 3, "length": 40, "speed": 25})]
+        assert unit.afc.move_e_pos.calls == [((40, 25, "gear catch"), {})]
+        assert unit.afc.toolhead.wait_moves.calls == [((), {})]
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 0mm on towards the gears, "
+                     "then 40mm with the extruder")]
+
+    def test_no_catch_feeds_whole_distance_without_extruder(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=80,
+                                                    sensor_to_gears_catch=0,
+                                                    sensor_to_gears_speed=16)
+        wire = AceP1Wire(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is True
+
+        assert wire.moves() == [("feed_filament", {"index": 3, "length": 80, "speed": 16})]
+        assert unit.afc.move_e_pos.calls == []
+        assert unit.afc.toolhead.wait_moves.calls == []
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 80mm on towards the gears, "
+                     "then 0mm with the extruder")]
+
+    def test_fast_feed_stall_skips_catch(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=300,
+                                                    sensor_to_gears_catch=100)
+        wire = AceP1Wire(unit)
+        wire.stall(True)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is True
+
+        assert wire.moves() == [("feed_filament", {"index": 3, "length": 200, "speed": 25})]
+        assert unit.afc.move_e_pos.calls == []
+        assert unit.afc.toolhead.wait_moves.calls == []
+        # _note_move_error logs a move's error once, however many polls show it.
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 200mm on towards the gears, "
+                     "then 100mm with the extruder"),
+            ("warning", "ACE Ace_1: slot 3 reported feed_error"),
+            ("info", "ACE load: lane3 stopped at the gears")]
+
+    def test_fast_feed_failure_stops_before_catch(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=300,
+                                                    sensor_to_gears_catch=100)
+        wire = AceP1Wire(unit)
+        wire.fail("feed_filament", RuntimeError("serial down"))
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is False
+
+        assert wire.moves() == [("feed_filament", {"index": 3, "length": 200, "speed": 25})]
+        assert unit.afc.move_e_pos.calls == []
+        assert unit.afc.toolhead.wait_moves.calls == []
+        assert unit.afc.error.handle_lane_failure.calls == [
+            ((lane, "ACE push to gears failed: serial down"), {"pause": False})]
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 200mm on towards the gears, "
+                     "then 100mm with the extruder")]
+
+    #: Logged when a long push feed never shows motion on slot 3.
+    NO_START = ("debug", "ACE wait: slot 3 never reported motion after feed/unwind command, "
+                         "motor may not have started")
+    #: get_status while slot 3 sits in a V1 feed_error: it never reads as idle again.
+    SLOT3_FEED_ERROR = {"status": "ready", "slots": [
+        {"index": 0, "status": "ready"}, {"index": 1, "status": "ready"},
+        {"index": 2, "status": "ready"}, {"index": 3, "status": "feed_error"}]}
+
+    @staticmethod
+    def _record_wait_moves(unit: afcACE) -> None:
+        """
+        :param unit: unit whose toolhead wait_moves goes on the printer timeline
+        """
+        unit.afc.toolhead.wait_moves = lambda: unit.printer.timeline.append(("wait_moves", ()))
+
+    @staticmethod
+    def _push_steps(unit: afcACE) -> List[Tuple[str, Any]]:
+        """
+        :param unit: unit whose timeline to read
+        :return list: the feeds, extruder moves, toolhead waits and lane failures, in order
+        """
+        return [entry for entry in unit.printer.timeline
+                if entry[0] in ("move_e_pos", "wait_moves", "handle_lane_failure")
+                or (entry[0] == "send_command" and entry[1][0] == "feed_filament")]
+
+    def test_fast_feed_that_never_starts_fails_without_catch(self):
+        # No wire: the slot never shows motion, so the fast feed is a no-start.
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=300,
+                                                    sensor_to_gears_catch=100)
+        self._record_wait_moves(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is False
+
+        assert self._push_steps(unit) == [
+            ("send_command", ("feed_filament", {"index": 3, "length": 200, "speed": 25})),
+            ("handle_lane_failure",
+             ("lane3", "ACE push to gears failed: the 200mm feed did not finish"))]
+        assert unit.afc.error.handle_lane_failure.calls[0][1] == {"pause": False}
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 200mm on towards the gears, "
+                     "then 100mm with the extruder"),
+            self.NO_START]
+
+    def test_load_reports_push_failure_instead_of_moving_to_the_nozzle(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=300,
+                                                    sensor_to_gears_catch=100,
+                                                    use_feed_assist=False)
+
+        def on_move(method: str, params: Dict[str, Any]) -> None:
+            """
+            The bowden feed reaches the toolhead sensor; the unit then stops
+            answering with motion, so the push after it never starts.
+
+            :param method: the move
+            :param params: its params
+            """
+            if len(wire.moves()) == 1:
+                lane.extruder_obj.tool_start_state = True
+            else:
+                unit._ace.set_reply("get_status", {"status": "ready", "slots": []})
+        wire = AceP1Wire(unit, on_move=on_move)
+
+        assert unit._ace_load_inner(lane, lane.extruder_obj) is False
+
+        assert wire.moves() == [TestAfcACEAceLoadInner._feed(3870, 80),
+                                TestAfcACEAceLoadInner._feed(200, 25)]
+        # No tool_stn advance after the failed push.
+        assert unit.afc.move_e_pos.calls == []
+        assert unit.afc.error.handle_lane_failure.calls == [
+            ((lane, "ACE push to gears failed: the 200mm feed did not finish"),
+             {"pause": False})]
+
+    def test_fast_feed_error_that_never_settles_still_stops_at_the_gears(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=300,
+                                                    sensor_to_gears_catch=100)
+        unit._ace.set_reply("get_status", {"status": "ready", "slots": []},
+                            self.SLOT3_FEED_ERROR)
+        self._record_wait_moves(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is True
+
+        assert self._push_steps(unit) == [
+            ("send_command", ("feed_filament", {"index": 3, "length": 200, "speed": 25}))]
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 200mm on towards the gears, "
+                     "then 100mm with the extruder"),
+            ("warning", "ACE Ace_1: slot 3 reported feed_error"),
+            ("debug", "ACE wait: timeout waiting for slot 3 movement (27.0s)"),
+            ("info", "ACE load: lane3 stopped at the gears")]
+
+    def test_catch_feed_that_never_starts_fails_after_the_extruder_move(self):
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=200,
+                                                    sensor_to_gears_catch=200)
+        self._record_wait_moves(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is False
+
+        # The queued extruder catch finishes before the failure is reported.
+        assert self._push_steps(unit) == [
+            ("send_command", ("feed_filament", {"index": 3, "length": 200, "speed": 25})),
+            ("move_e_pos", (200, 25, "gear catch", False)),
+            ("wait_moves", ()),
+            ("handle_lane_failure",
+             ("lane3", "ACE push to gears failed: the 200mm gear catch feed did not finish"))]
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 0mm on towards the gears, "
+                     "then 200mm with the extruder"),
+            self.NO_START]
+
+    def test_catch_feed_error_that_times_out_fails_the_lane(self):
+        # Only a fast-part stall means the tip reached the gears early; the catch
+        # already runs with the extruder, so a catch that never settles is a failure.
+        unit, lane = TestAfcACEAceLoadInner._staged(sensor_to_gears=40,
+                                                    sensor_to_gears_catch=100)
+        unit._ace.set_reply("get_status", {"status": "ready", "slots": []},
+                            self.SLOT3_FEED_ERROR)
+        self._record_wait_moves(unit)
+
+        assert unit._push_to_gears(lane, lane.extruder_obj, 3) is False
+
+        assert self._push_steps(unit) == [
+            ("send_command", ("feed_filament", {"index": 3, "length": 40, "speed": 25})),
+            ("move_e_pos", (40, 25, "gear catch", False)),
+            ("wait_moves", ()),
+            ("handle_lane_failure",
+             ("lane3", "ACE push to gears failed: the 40mm gear catch feed did not finish"))]
+        assert unit.afc.error.handle_lane_failure.calls[0][1] == {"pause": False}
+        assert unit.logger.messages == [
+            ("info", "ACE load: pushing lane3 0mm on towards the gears, "
+                     "then 40mm with the extruder"),
+            ("warning", "ACE Ace_1: slot 3 reported feed_error"),
+            ("debug", "ACE wait: timeout waiting for slot 3 movement (17.4s)")]
 
 
 class TestAfcACELaneUnloading:

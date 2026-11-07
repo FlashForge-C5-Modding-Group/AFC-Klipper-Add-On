@@ -5,6 +5,7 @@ from __future__ import annotations
 import configparser
 import struct
 import sys
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import pytest
@@ -14,6 +15,7 @@ from extras.AFC_ACE2 import (
     _ace2_extract_uid,
     _ace2_scan_candidates,
     _ace2_topology_key,
+    _ace2_usb_vendor,
     _decode_status,
     _fstr,
     _fval,
@@ -1208,6 +1210,50 @@ class TestDecodeFrames:
         assert buf == bytearray()
 
 
+def _ace2_sysfs_tree(root: Path) -> Path:
+    """
+    sysfs as Linux lays out USB serial devices behind a WCH (vendor 1a86) hub
+    on 1-1: ttyACM0 an ACE 2 on hub port 4 and ttyACM1 one on port 2 (tty
+    numbers the reverse of cable order), ttyUSB0 a CH341 on port 3, ttyUSB1 an
+    FTDI adapter on port 1, and ttyACM9 with no device behind it. A ttyACM's
+    device link is its USB interface, a ttyUSB's the usb-serial port below the
+    interface; only the USB devices (and the hub) carry idVendor.
+
+    :param root: directory to build the tree in
+    :return Path: the tree's class/tty directory
+    """
+    hub = root / "sys" / "devices" / "platform" / "soc" / "fe980000.usb" / "usb1" / "1-1"
+    hub.mkdir(parents=True)
+    (hub / "idVendor").write_text("1a86\n", encoding="ascii")
+    tty_class = root / "sys" / "class" / "tty"
+    for name, port, vendor, usb_serial in (("ttyACM0", 4, "1a86", False),
+                                           ("ttyACM1", 2, "1a86", False),
+                                           ("ttyUSB0", 3, "1a86", True),
+                                           ("ttyUSB1", 1, "0403", True)):
+        usb_device = hub / f"1-1.{port}"
+        interface = usb_device / f"1-1.{port}:1.0"
+        device = interface / name if usb_serial else interface
+        device.mkdir(parents=True)
+        (usb_device / "idVendor").write_text(vendor + "\n", encoding="ascii")
+        (tty_class / name).mkdir(parents=True)
+        (tty_class / name / "device").symlink_to(device, target_is_directory=True)
+    (tty_class / "ttyACM9").mkdir()
+    return tty_class
+
+
+def _ace2_without_udev_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    No udev: the /dev/serial by-id and by-path globs find nothing; other globs run.
+
+    :param monkeypatch: patches glob.glob
+    """
+    real_glob = afc_ace2_module.glob.glob
+    monkeypatch.setattr(afc_ace2_module.glob, "glob",
+                        lambda pattern: ([] if pattern.startswith("/dev/serial/")
+                                         else real_glob(pattern)))
+
+
+
 class TestAce2ScanCandidates:
     def test_resolves_real_paths_in_sorted_glob_order(self, monkeypatch):
         # glob order is deliberately not sorted, to prove the sorted() wrapper
@@ -1239,6 +1285,55 @@ class TestAce2ScanCandidates:
 
         assert _ace2_scan_candidates() == []
 
+    def test_sysfs_fallback_reads_the_usb_device_vendor_for_acm_and_usb_ttys(self,
+                                                                             monkeypatch,
+                                                                             tmp_path):
+        monkeypatch.setattr(afc_ace2_module, "ACE2_SYSFS_TTY", str(_ace2_sysfs_tree(tmp_path)))
+        _ace2_without_udev_links(monkeypatch)
+
+        # ttyUSB1 (FTDI) is excluded although the hub above it is a WCH one;
+        # ttyACM9 has no device behind it.
+        assert _ace2_scan_candidates() == ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"]
+
+    def test_by_id_candidates_take_precedence_over_sysfs(self, monkeypatch, tmp_path):
+        by_id = tmp_path / "serial" / "by-id"
+        by_id.mkdir(parents=True)
+        device = by_id / "usb-1a86_USB_Single_Serial_123-if00"
+        device.touch()
+        monkeypatch.setattr(afc_ace2_module, "ACE2_SYSFS_TTY", str(_ace2_sysfs_tree(tmp_path)))
+        real_glob = afc_ace2_module.glob.glob
+
+        def glob_in_fixture(pattern):
+            """
+            :param pattern: glob pattern
+            :return list: the fixture's by-id links, or sysfs matches
+            """
+            if pattern == afc_ace2_module.ACE2_BYID_GLOB:
+                return real_glob(str(by_id / "*1a86_USB_Single_Serial*-if00"))
+            return real_glob(pattern)
+
+        monkeypatch.setattr(afc_ace2_module.glob, "glob", glob_in_fixture)
+
+        assert _ace2_scan_candidates() == [str(device.resolve())]
+
+
+class TestAce2UsbVendor:
+    def test_nearest_ancestor_vendor_wins_over_the_hub(self, tmp_path):
+        hub = tmp_path / "usb1" / "1-1"
+        port = hub / "1-1.1" / "1-1.1:1.0" / "ttyUSB1"
+        port.mkdir(parents=True)
+        (hub / "idVendor").write_text("1a86\n", encoding="ascii")
+        (hub / "1-1.1" / "idVendor").write_text("0403\n", encoding="ascii")
+
+        assert _ace2_usb_vendor(str(port)) == "0403"
+
+    def test_no_vendor_up_to_the_root_is_none(self, tmp_path):
+        device = tmp_path / "platform" / "serial8250" / "tty" / "ttyS0"
+        device.mkdir(parents=True)
+
+        assert _ace2_usb_vendor(str(device)) is None
+
+
 
 class TestAce2TopologyKey:
     def test_matching_bypath_zero_pads_digit_runs(self, monkeypatch):
@@ -1251,17 +1346,20 @@ class TestAce2TopologyKey:
         # "1", "22" and "333" each zero-pad out to 6 digits.
         assert _ace2_topology_key("/dev/ttyACM5") == "a000001b000022c000333"
 
-    def test_no_match_falls_back_to_zero_padded_real_tty(self, monkeypatch):
+    def test_no_match_falls_back_to_zero_padded_real_tty(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(afc_ace2_module, "ACE2_SYSFS_TTY", str(tmp_path))
         monkeypatch.setattr(
             afc_ace2_module.glob, "glob",
             lambda pattern: ["/dev/serial/by-path/other"])
         monkeypatch.setattr(afc_ace2_module.os.path, "realpath", lambda p: "/dev/ttyACM9")
 
-        # No by-path entry resolves to the real tty, so bypath stays empty and
-        # the ternary falls back to the (zero-padded) real_tty argument.
+        # No by-path entry resolves to the real tty and sysfs has no device for
+        # it, so the key falls back to the (zero-padded) real_tty argument.
         assert _ace2_topology_key("/dev/ttyACM7") == "/dev/ttyACM000007"
 
-    def test_glob_exception_falls_back_to_zero_padded_real_tty(self, monkeypatch):
+    def test_glob_exception_falls_back_to_zero_padded_real_tty(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(afc_ace2_module, "ACE2_SYSFS_TTY", str(tmp_path))
+
         def boom(pattern: str) -> List[str]:
             """
             :param pattern: the glob pattern
@@ -1606,6 +1704,22 @@ class TestResolveAce2Port:
         monkeypatch.setattr(afc_ace2_module, "_ace2_topology_key", bus.key)
         monkeypatch.setattr(afc_ace2_module, "time", bus.clock)
         return bus
+
+    def test_without_udev_ace_index_follows_the_usb_port_not_the_tty_number(self, monkeypatch,
+                                                                            tmp_path):
+        monkeypatch.setattr(afc_ace2_module, "ACE2_SYSFS_TTY", str(_ace2_sysfs_tree(tmp_path)))
+        _ace2_without_udev_links(monkeypatch)
+        # Only the two ACE 2 units answer the discover probe; the CH341 does not.
+        uids = {"/dev/ttyACM0": (44, 0, 0), "/dev/ttyACM1": (22, 0, 0)}
+        probes: List[str] = []
+        monkeypatch.setattr(afc_ace2_module, "probe_ace2_uid",
+                            lambda port, baud: probes.append(port) or uids.get(port))
+        monkeypatch.setattr(afc_ace2_module, "time", self.Clock())
+
+        # ttyACM1 is on hub port 2, ttyACM0 on port 4.
+        assert resolve_ace2_port(1, 230400, settle=0.0) == "/dev/ttyACM1"
+        assert resolve_ace2_port(2, 230400, settle=0.0) == "/dev/ttyACM0"
+        assert sorted(set(probes)) == ["/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyUSB0"]
 
     def test_resolve_by_topology_cable_order(self, monkeypatch):
         bus = self._bus(monkeypatch, {"/dev/ttyACM9": (11, 0, 0), "/dev/ttyACM2": (22, 0, 0)},

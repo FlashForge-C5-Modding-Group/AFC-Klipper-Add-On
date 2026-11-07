@@ -752,11 +752,46 @@ def decode_frames(buffer: bytearray,
 # (cable order); the STM32 UID confirms an ACE 2 and allows pinning via ace_uid.
 # Only unclaimed ports are probed.
 ACE2_BYID_GLOB = "/dev/serial/by-id/*1a86_USB_Single_Serial*-if00"
+ACE2_SYSFS_TTY = "/sys/class/tty"
+
+def _ace2_sysfs_device(tty_name: str) -> Optional[str]:
+    """
+    The physical sysfs device behind a tty: the USB interface for a ttyACM, the
+    usb-serial port below the interface for a ttyUSB. Its path is the USB topology.
+
+    :param tty_name: tty name, e.g. "ttyACM0"
+    :return Optional[str]: the resolved device directory, or None without one
+    """
+    link = os.path.join(ACE2_SYSFS_TTY, tty_name, "device")
+    if not os.path.exists(link):
+        return None
+    return os.path.realpath(link)
+
+def _ace2_usb_vendor(device: str) -> Optional[str]:
+    """
+    idVendor of the USB device a tty's sysfs device belongs to: the nearest
+    ancestor carrying one, since neither the interface nor a usb-serial port has it.
+
+    :param device: resolved sysfs device directory of the tty
+    :return Optional[str]: the vendor id, e.g. "1a86", or None if none is found
+    """
+    path = device
+    while True:
+        with contextlib.suppress(OSError):
+            with open(os.path.join(path, "idVendor")) as f:
+                return f.read().strip()
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
 def _ace2_scan_candidates() -> List[str]:
     """
-    CH34x serial devices currently present, as real tty paths.
+    CH34x serial devices currently present, as real tty paths. Without udev
+    (no /dev/serial/by-id) they are found through sysfs by USB vendor 1a86.
 
-    :return List[str]: resolved tty paths, sorted by their by-id link
+    :return List[str]: resolved tty paths, sorted by their by-id link, or by tty name
+                       when found through sysfs
     """
     out: List[str] = []
     for p in sorted(glob.glob(ACE2_BYID_GLOB)):
@@ -764,28 +799,43 @@ def _ace2_scan_candidates() -> List[str]:
             out.append(os.path.realpath(p))
         except Exception:
             out.append(p)
+    if out:
+        return out
+    for tty in sorted(glob.glob(os.path.join(ACE2_SYSFS_TTY, "ttyACM*"))
+                      + glob.glob(os.path.join(ACE2_SYSFS_TTY, "ttyUSB*"))):
+        name = os.path.basename(tty)
+        with contextlib.suppress(Exception):
+            device = _ace2_sysfs_device(name)
+            if (device is not None
+                and _ace2_usb_vendor(device) == "1a86"):
+                out.append("/dev/" + name)
     return out
 
 def _ace2_topology_key(real_tty: str) -> str:
     """
     Stable USB-topology sort key so 'cable order' is consistent across
-    reboots: the /dev/serial/by-path link for this tty, with digit runs
-    zero-padded so 2.10 sorts after 2.2 rather than lexically before it.
+    reboots: the /dev/serial/by-path link for this tty, or without udev its
+    physical sysfs device path, with digit runs zero-padded so 2.10 sorts
+    after 2.2 rather than lexically before it. The tty name, which follows
+    enumeration order, is the last resort.
 
     :param real_tty: resolved tty path of the device
     :return str: the sort key
     """
     import re
-    bypath = ""
+    topology = ""
     try:
         for p in glob.glob("/dev/serial/by-path/*"):
             with contextlib.suppress(Exception):
                 if os.path.realpath(p) == real_tty:
-                    bypath = os.path.basename(p)
+                    topology = os.path.basename(p)
                     break
     except Exception:
         pass
-    return re.sub(r"\d+", lambda m: m.group().zfill(6), bypath or real_tty)
+    if not topology:
+        with contextlib.suppress(Exception):
+            topology = _ace2_sysfs_device(os.path.basename(real_tty)) or ""
+    return re.sub(r"\d+", lambda m: m.group().zfill(6), topology or real_tty)
 
 def _ace2_extract_uid(buf: bytearray) -> Optional[Tuple[int, int, int]]:
     """

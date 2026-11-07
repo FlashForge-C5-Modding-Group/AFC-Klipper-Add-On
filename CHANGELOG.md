@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [11-07-2026]
+### Added
+- `[AFC]` options `enable_print_metadata`, `print_metadata_delay`, `track_filament_weight` and `enable_td1_detection`; `VarFile` now expands `~`.
+- `[AFC_extruder]` options `creator5_tool_index` (Creator 5 physical heads: mount sensors drive `on_shuttle`, PREP, status, runout and tool changes) and `auto_load_on_tool_start`.
+- `[AFC_ACE]` options `sensor_to_gears`, `sensor_to_gears_speed` and `sensor_to_gears_catch` to push filament from a distant toolhead sensor to the extruder gears. A push feed that does not finish fails the lane; only a feed error in the fast part (the tip stopped at the gears early) ends the push without the catch.
+- ACE 2 discovery finds CH34x ports through sysfs (USB vendor `1a86`, read from the USB device above the tty, so both `ttyACM` and `ttyUSB` ports are found) when `/dev/serial/by-id` is missing. Without `/dev/serial/by-path`, `ace_index` follows the physical USB port path instead of tty numbering.
+- `RESET_AFC_MAPPING` kept as an alias of `AFC_RESET_MAPPING`.
+- TRSYNC updates are applied through Kalico's `[danger_options]` when it is present: the `klippy.extras.danger_options` instance Kalico loads, or the top-level `extras.danger_options` on pre-package Danger Klipper. Klipper still updates the `mcu` module timeouts.
+
+### Changed
+- Ported from Kalico `ace-upstream` `761a2972` (including `something` `d79c168b`) and fork PR #1 (`9ad1682`, `a1f28d3`). Kalico commits by file:
+  - `AFC.py`: `2653cf7d`, `6e13f478`, `a7afc143`, `e1f45a20`, `2752b70a`, `2defa120`, `dce5740f`
+  - `AFC_ACE.py`: `d95cc11b`, `855f8fef`; `AFC_ACE2.py`: `cb4c629a`
+  - `AFC_Toolchanger.py`: `2653cf7d`, `e1f45a20`, `881ab7b3`
+  - `AFC_extruder.py`: `2653cf7d`, `a7afc143`, `d95cc11b`
+  - `AFC_lane.py`: `2653cf7d`, `6e13f478`, `e1f45a20`, `195ef150`, `2defa120`
+  - `AFC_spool.py`: `2653cf7d`, `e1f45a20`, `d00d9e23`, `6e13f478`
+  - `AFC_utils.py`: `2653cf7d`, `e1f45a20`, `a7afc143`, `2752b70a`, `6e13f478`
+  - `AFC_assist.py`: `2653cf7d`, `a7afc143`; `AFC_functions.py`: `2653cf7d`, `e1f45a20`; `AFC_prep.py`: `e1f45a20`
+- Compatibility decisions for the port:
+  - The standalone import layout (`configfile`, `gcode`, `chelper`, `mcu`, `extras.*`, `klippy.Printer`) is kept instead of Kalico's `klippy.`-qualified imports. Kalico's import hook (`klippy/compat.py`, installed before the printer starts) resolves these names to its loaded `klippy.*` modules.
+  - Creator 5 behavior runs only when `creator5_tool_index` is set; other printers keep the upstream paths. The `tool_swap` toolchange counter and the lift before the XY move in `restore_pos` apply only on those paths.
+  - Git version reporting is kept and cached; Kalico's bundled-build version suppression is not ported. `join_threads` keeps its name; duplicate spool IDs are still compared as strings.
+
+### Fixed
+- Moonraker requests run on one FIFO worker; result-dependent callers wait cooperatively, so spool lookups, TD-1 queries and print metadata no longer block the reactor. Obsolete metadata and spool replies are discarded.
+- Disconnect writes every queued `AFC.var.unit` snapshot before attempting admitted Moonraker work; saves after disconnect are written directly.
+- Repeating `PREP` keeps initialized statistics and no longer re-runs git for the version string.
+- Failed tool selection preserves saved resume coordinates instead of leaving the previous tool offsets subtracted.
+
 ## [11-02-2026]
 ### Fixed
 - Fixed a bug where a lane without an extruder stepper could error out if the `QUERY_BUFFER` macro was run. 
